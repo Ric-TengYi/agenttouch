@@ -88,10 +88,13 @@ void dashboardHandle(JsonDocument& d,int idx,uint32_t now) {
     if(d["title_clipped"]|false) titleLines.push_back("标题过长，完整内容请在Mac查看");
   } else if(t=="task_status" && page==4 && pageAgent==idx && token.length() && String(d["token"]|"")==token) {
     String phase=d["phase"]|""; error=d["error"]|"";
-    if(error.length()) { status="无法确认目标，请在Mac查看"; canSend=false; }
+    if(error.length()) {
+      status=error=="preview_empty"?"预览为空，请在Mac录入":error=="preview_unavailable"?"请检查Mac语音预览框":error=="delivery_unconfirmed"?"发送未确认，请在Mac查看":"目标已变更，请返回刷新";
+      canSend=error=="preview_empty";
+    }
     else if(phase=="selected") status="按住右键说话，松开后发送";
-    else if(phase=="voice_start") { status="正在录入..."; canSend=false; }
-    else if(phase=="voice_stop") { status="录入结束，点击发送"; canSend=true; }
+    else if(phase=="voice_start") { status=pageAgent==1?"正在Mac预览框录入...":"正在录入..."; canSend=false; }
+    else if(phase=="voice_stop") { status=pageAgent==1?"在Mac确认文字，点击发送":"录入结束，点击发送"; canSend=true; }
     else if(phase=="sent") { status="已发送"; canSend=false; }
   }
 }

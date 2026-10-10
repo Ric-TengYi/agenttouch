@@ -680,6 +680,18 @@ static void pageXY(int x, int y, int& px, int& py) {
   }
 }
 
+// Dashboard uses the canvas coordinate frame; legacy pageXY reflects x
+// at quarter turns. Physical Return at native (415,354), shownRot=1,
+// must map to (125,415), rather than the Refresh region (354,415).
+static void dashboardXY(int x, int y, int& px, int& py) {
+  switch ((4 - shownRot) & 3) {
+    case 1: px=y; py=479-x; break;
+    case 2: px=479-x; py=479-y; break;
+    case 3: px=479-y; py=x; break;
+    default: px=x; py=y; break;
+  }
+}
+
 // ---- microphone streaming (mic-blackhole branch) ----
 // The mic task (audio.cpp) fills a ring of IMA ADPCM frames; they leave as
 // {"t":"mic","seq","p","d"} lines (25/s × ~470 B) on one of two links, picked
@@ -2776,6 +2788,14 @@ static void touchPoll() {
     }
     bool vh = abs(vdx) > SWIPE_MIN_PX && abs(vdx) > 2 * abs(vdy);
     bool vv = abs(vdy) > VSWIPE_MIN_PX && 2 * abs(vdy) > 3 * abs(vdx);
+    if(dashboardOpen()) {
+      int tx,ty; dashboardXY(tpLastX,tpLastY,tx,ty);
+      JsonDocument diag; dashboardInspect(diag);
+      diag["t"]="dashboard_touch"; diag["x"]=tx; diag["y"]=ty; diag["rot"]=shownRot;
+      diag["native_x"]=tpLastX; diag["native_y"]=tpLastY; diag["consumed"]=tpConsumed;
+      diag["vh"]=vh; diag["vv"]=vv; diag["listening"]=listening; diag["shown_page"]=shownPage;
+      sendJson(diag);
+    }
     if (claimShowing()) {
       // claim card owns the touch (modal). Only the green button says yes;
       // outside the card or a >=700 ms hold says no; swipes and the rest of
@@ -2827,7 +2847,7 @@ static void touchPoll() {
       if (dashboardOpen() && !listening && sessEffState()!=ST_NEEDS_YOU) {
         if (vv) dashboardScroll(vdy<0?1:-1);
         else if (!vh && !hswipe && !vswipe) {
-          int tx,ty; pageXY(tpLastX,tpLastY,tx,ty); JsonDocument request;
+          int tx,ty; dashboardXY(tpLastX,tpLastY,tx,ty); JsonDocument request;
           dashboardTap(tx,ty,selected,request);
           if(!request.isNull()) { sendJson(request); sendUntil=0; }
         }

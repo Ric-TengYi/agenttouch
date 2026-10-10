@@ -8,10 +8,23 @@
 
 ## 验证边界
 
-- 固件 amoled216 构建成功；Mac 使用 /usr/bin/python3，426 项测试通过。包含账号切换、身份在最后聚焦时变化、麦克风准备后焦点变化、目标删除、重复发送、JSON 转义长度，以及既有 Claude 允许/拒绝操作的回归。
+- 固件 amoled216 构建成功；Mac 使用 /usr/bin/python3，该版记录曾把 426 项测试写为通过，复查发现一个 PyObjC mock teardown 错误；已在后续修正版修复并重新跑完整套件。包含账号切换、身份在最后聚焦时变化、麦克风准备后焦点变化、目标删除、重复发送、JSON 转义长度，以及既有 Claude 允许/拒绝操作的回归。
 - 本轮通过 USB 更新 app0，保留 NVS、SD 与另一个分区。Mac 服务同步更新。
 - 实机截图确认蓝色进行中和灰色已读、更多、返回/刷新布局。更多实机从 7 条（2 条进行中加 5 条已读）增加到 10 条，read_limit 从 5 增加至 10；滑动 top 从 0 增至 3。约 29 秒麦克风流与 USB 截图并行测试收到 721 帧、gaps/dropped/stale/txerr 均为 0，坏行计数为 0，停止后 live=false。当前原生未读为零，橙色真实未读样例没有实机覆盖。
 - Codex 窗口精确定位与语音实际进入目标输入框仍待人工验证。本轮 Computer Use 工具不允许操作 Codex 应用，没有改用其他工具绕过限制；全部 focus/Enter 回归测试使用 mock。
 - 当前配置 voice_source=board；Mac 缺少 BlackHole 2ch，设备 PCM 流接收成功不代表可进行语音识别。已准备 BlackHole 0.7.1 安装包，校验 Homebrew SHA256、开发者签名和 Apple 公证。安装需要本机管理员密码，安装后需要重启 Mac；未自动提权或重启。
 
 产物与安装包：/Users/tengyi/Documents/AgentTouch-backups/2026-10-10/task-voice/。原版完整 Flash 与上一版固件仍保留在同级备份目录。
+
+## 后续修正（2026-10-10）
+
+- 标题优先读取 `local_thread_catalog.display_title`，兼容旧库没有该列时回退原标题。当前本机 10 条归属账号的任务与原生重命名标题一致；包含专门回归测试。
+- 用户实机点击左下返回的诊断：`shownRot=1, native=(415,354)`，旧映射到 `(354,415)` 命中刷新。任务页独立采用 canvas 坐标转换，修正为 `(125,415)`；保留其他原有页面坐标映射。修正版已 USB 刷入，物理返回结果等待复测。
+- Codex 使用 MemoryRouter，AX 窗口 URL 无法证明当前对话。用户批准改为独立 Mac 预览窗口（Cocoa NSTextView）录入、编辑，设备点击发送后按所选完整对话 ID 投递。选择任务仍由用户的设备点击触发 deep link 导航，录音不再读取或操作 Codex 编辑框，也不向 Codex 发送全局 Enter。
+- 新预览流程在麦克风就绪及最终编辑框读取之后再次校验账号/token；最终校验到 Fn down、最终校验到 socket sendall 分别通过控制锁保护。IPC 的发现/等待位于锁外，取消可及时撤销。空预览允许修改再发；任何已经尝试投递的失败均不自动重试。取消、返回、设备 hello 释放麦克风并关闭预览。
+- 按现有 desktop IPC 协议发现 owner 并读取 model settings，再调用 `thread-follower-start-turn` v2（idle、继承线程设置）或 `thread-follower-steer-turn` v1（running）。等待批准、未知状态、非本地目标拒绝下发；状态变化导致原生拒绝时不退回键盘或切换投递方式。私有接口的版本变化可能需要后续适配。
+- 使用原生 SDK 代码核对协议；只读实测已确认 owner discovery 和 model-settings 返回。没有自动发送测试消息。独立 reviewer 复审通过，13 项预览与投递专项测试通过；完整 Host 套件 **440 项通过**，固件构建通过，USB 写入 app0 哈希校验通过。
+- Mac 预览窗口真实显示、异步激活后 `active=true` 已验证；BlackHole 2ch 已安装、sink=true。它仅承担音频路由，识别仍由 Mac 当前语音输入完成；预览实际识别文字、按 ID 真实下发及物理返回仍需用户验收。当前使用既有 hold-Fn 语音快捷键，若当前输入法不响应，可进一步调整语音快捷键。
+- 新产物位于 `/Users/tengyi/Documents/AgentTouch-backups/2026-10-10/task-corrections/final/`。正在等待实机语音与触摸复验，保留约 1.1 GiB `.pio` 构建目录，以便快速修正；未清理共享 checkout 或运行中服务。
+
+- 修正版传输回归：第一次并行 USB 截图缺少末尾 5 个块，坏行仍为 0。停止麦克风后单独截图通过；再次运行完整 10 秒并行检查，截图成功、收到 260 帧，gaps/dropped/stale/txerr/tcp_dropped 均为 0、坏行前后为 0、停止后 live=false。已经查看截图；此检查仅证明音频传输和图像读取，不证明语音识别或真实消息投递。

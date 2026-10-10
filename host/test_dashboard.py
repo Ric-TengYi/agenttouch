@@ -58,6 +58,15 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(snap["unread"]["quality"], "partial")
         self.assertEqual({t["title"] for t in snap["tasks"]}, {"a", "b"})
 
+    def test_catalog_display_title_overrides_initial_thread_title(self):
+        db=sqlite3.connect(self.home / "sqlite/codex-dev.db")
+        db.execute("ALTER TABLE local_thread_catalog ADD COLUMN display_title TEXT")
+        db.execute("UPDATE local_thread_catalog SET display_title='重命名的标题' WHERE thread_id='a'")
+        db.commit();db.close()
+        snap=D.read_codex(self.home,1000)
+        self.assertEqual(next(r for r in snap['tasks'] if r['thread_id']=='a')['title'],'重命名的标题')
+        self.assertEqual(next(r for r in snap['tasks'] if r['thread_id']=='b')['title'],'b')
+
     def test_unknown_version_does_not_report_zero(self):
         self.assertIsNotNone(D)
         self.global_state["electron-thread-read-state-v1"]["version"] = 2

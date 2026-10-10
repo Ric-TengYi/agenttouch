@@ -23,23 +23,36 @@ dashboard_service = DashboardService()
 from task_control import TaskControl, SelectedVoice
 from task_focus import focus_codex
 task_control = TaskControl(dashboard_service.store)
+dashboard_last_touch = {}
 
 
 def selected_focus(row):
     if row['agent'] == 'claude':
         return focus_session_fast(row['thread_id'], exact_only=True) in ('warp', 'terminal', 'iterm', 'ghostty')
-    # Re-read identity immediately before native focus, rather than trusting
-    # the background collector's five-second-old account snapshot.
-    from dashboard import identity
-    try:
-        from pathlib import Path
-        if identity(Path.home() / '.codex', time.time())[0] != dashboard_service.store.get('codex', time.time())['identity']:
-            return False
-    except (OSError, ValueError, KeyError, TypeError):
+    if not selected_identity(row):
         return False
-    ok = focus_codex(row, selected_frontmost, post_key, FOCUS_KEYS.get('codex'))
+    # User-triggered navigation only. Voice targets our own preview window;
+    # delivery uses stable IDs, so no Codex AX route/focus proof is needed.
+    import subprocess
+    import uuid
     try:
-        return ok and identity(Path.home() / '.codex', time.time())[0] == dashboard_service.store.get('codex', time.time())['identity']
+        tid = row['thread_id']
+        if str(uuid.UUID(tid)) != tid:
+            return False
+        return subprocess.run(['open', 'codex://threads/' + tid],
+            timeout=5, capture_output=True).returncode == 0 and selected_identity(row)
+    except (ValueError, OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def selected_identity(row):
+    from dashboard import identity
+    from pathlib import Path
+    try:
+        selected = task_control.selected
+        return (selected is not None and selected[1] == row['agent'] and
+                selected[3] == row['thread_id'] and
+                identity(Path.home() / '.codex', time.time())[0] == selected[2])
     except (OSError, ValueError, KeyError, TypeError):
         return False
 
@@ -96,6 +109,22 @@ def selected_end():
 
 selected_voice = SelectedVoice(task_control, selected_focus, selected_begin,
                                selected_key, selected_end, lambda: post_key('enter'))
+from preview_control import PreviewVoice, PreviewWindow
+from codex_delivery import send_preview
+codex_preview = PreviewVoice(task_control, PreviewWindow(), selected_identity,
+                             selected_begin, selected_key, selected_end, send_preview)
+
+
+def cancel_selected_voice():
+    selected_voice.cancel()
+    codex_preview.cancel()
+
+
+def voice_for_token(token):
+    row = task_control.target(token)
+    return codex_preview if (token and token == codex_preview.token) or (row and row['agent'] == 'codex') else selected_voice
+
+
 import base64
 import ctypes
 import ctypes.util
@@ -3057,7 +3086,10 @@ def handle_board_msg(raw, reply):
     if not isinstance(m, dict):          # "[1,2]" / "42" are valid JSON, not messages
         return
     t = m.get("t")
-    if t == "tasks_get":
+    if t == 'dashboard_touch':
+        dashboard_last_touch.clear()
+        dashboard_last_touch.update(m)
+    elif t == "tasks_get":
         reply(dashboard_encode(dashboard_service.store.page(
             str(m.get("agent", "")), str(m.get("filter", "")),
             m.get("cursor", ""), m.get("request_id", ""), time.time(), m.get("read_limit", 5))))
@@ -3071,30 +3103,32 @@ def handle_board_msg(raw, reply):
         if result.get('token'):
             token = result['token']
             def open_selected():
-                selected_voice.cancel()
+                cancel_selected_voice()
                 ok = task_control.run(token, selected_focus, lambda row: None)
                 reply(dashboard_encode(dict(t='task_status', v=1, agent=agent, token=token,
                     error='' if ok else 'focus_unverified', phase='selected')))
             inject(open_selected)
     elif t == "task_cancel":
         task_control.clear()
-        inject(selected_voice.cancel)
+        inject(cancel_selected_voice)
     elif t == "voice" and 'target' in m:
         token = str(m.get('target', ''))
         agent = str(m.get('agent', ''))
         def selected_dictation():
             start = m.get('a') == 'start'
-            ok = selected_voice.start(token, VOICE_SOURCE == 'board' and bool(m.get('mic'))) if start else selected_voice.stop(token)
+            voice = voice_for_token(token)
+            ok = voice.start(token, VOICE_SOURCE == 'board' and bool(m.get('mic'))) if start else voice.stop(token)
             reply(dashboard_encode(dict(t='task_status', v=1, agent=agent, token=token,
-                error='' if ok else 'focus_unverified', phase='voice_start' if start else 'voice_stop')))
+                error='' if ok else getattr(voice, 'error', 'focus_unverified') or 'task_changed', phase='voice_start' if start else 'voice_stop')))
         inject(selected_dictation)
     elif t == "key" and 'target' in m:
         token = str(m.get('target', ''))
         agent = str(m.get('agent', ''))
         def selected_send():
-            ok = m.get('k') == 'enter' and selected_voice.send(token)
+            voice = voice_for_token(token)
+            ok = m.get('k') == 'enter' and voice.send(token)
             reply(dashboard_encode(dict(t='task_status', v=1, agent=agent, token=token,
-                error='' if ok else 'focus_unverified', phase='sent')))
+                error='' if ok else getattr(voice, 'error', 'focus_unverified') or 'task_changed', phase='sent')))
         inject(selected_send)
     elif t == "ping":
         # the BOARD's own heartbeat, not our /test/rtt probe:
@@ -3103,7 +3137,7 @@ def handle_board_msg(raw, reply):
         reply(b'{"t":"pong"}\n')
     elif t == "hello":
         task_control.clear()
-        inject(selected_voice.cancel)
+        inject(cancel_selected_voice)
         log("board hello:", m)
         for agent in ("codex", "claude"):
             reply(dashboard_encode(dashboard_service.store.summary(agent, time.time())))
@@ -7990,7 +8024,9 @@ class HookHandler(BaseHTTPRequestHandler):
             self._ok(json.dumps(out, ensure_ascii=False, indent=1).encode())
         elif self.path.startswith("/test/dashboard/"):
             action = self.path.rsplit("/", 1)[1]
-            if action == 'state':
+            if action == 'touch':
+                self._ok(json.dumps(dashboard_last_touch).encode())
+            elif action == 'state':
                 rid = _new_rid()
                 push_board(dict(t='dashboard_test', action='state', id=rid))
                 self._ok(json.dumps(wait_reply('dashboard_state', rid, 3) or dict(error='timeout')).encode())

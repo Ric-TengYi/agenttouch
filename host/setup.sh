@@ -119,7 +119,7 @@ fi
 # ---------------------------------------------------------------------------
 step "3. host 文件 → $DEPLOY"
 [ $CHECK = 1 ] || mkdir -p "$DEPLOY"
-for f in task_control.py task_focus.py dashboard.py dashboard_service.py codex_rpc.py claude_statusline.py agentpet_host.py almanac_bank.json agent_setup.md gen_almanac_font.py pet codex_notify.sh codex_permission_hook.sh; do
+for f in voice_preview.py preview_control.py codex_delivery.py task_control.py task_focus.py dashboard.py dashboard_service.py codex_rpc.py claude_statusline.py agentpet_host.py almanac_bank.json agent_setup.md gen_almanac_font.py pet codex_notify.sh codex_permission_hook.sh; do
   if cmp -s "$SRC/$f" "$DEPLOY/$f"; then ok "$f 一致"
   elif doit "拷 $f"; then
     cp "$SRC/$f" "$DEPLOY/$f.tmp" && mv -f "$DEPLOY/$f.tmp" "$DEPLOY/$f" && did "$f"

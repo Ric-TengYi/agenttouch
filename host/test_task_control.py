@@ -243,9 +243,9 @@ class ForegroundRegressionTests(unittest.TestCase):
     def test_selected_focus_queries_fresh_window_owner(self):
         import agentpet_host as H
         import Quartz
-        from AppKit import NSRunningApplication
         from unittest.mock import patch, Mock
+        import sys, types
         app=Mock();app.bundleIdentifier.return_value='com.openai.codex'
-        with patch.object(Quartz,'CGWindowListCopyWindowInfo',return_value=[{'kCGWindowLayer':2,'kCGWindowOwnerPID':10},{'kCGWindowLayer':0,'kCGWindowOwnerPID':99}]),patch.object(NSRunningApplication,'runningApplicationWithProcessIdentifier_',return_value=app) as lookup:
+        with patch.object(Quartz,'CGWindowListCopyWindowInfo',return_value=[{'kCGWindowLayer':2,'kCGWindowOwnerPID':10},{'kCGWindowLayer':0,'kCGWindowOwnerPID':99}]),patch.dict(sys.modules,{'AppKit':types.SimpleNamespace(NSRunningApplication=Mock(runningApplicationWithProcessIdentifier_=Mock(return_value=app))) }):
             self.assertEqual(H.selected_frontmost(),('com.openai.codex',99))
-            lookup.assert_called_once_with(99)
+            sys.modules['AppKit'].NSRunningApplication.runningApplicationWithProcessIdentifier_.assert_called_once_with(99)

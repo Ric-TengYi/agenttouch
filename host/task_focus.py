@@ -4,6 +4,9 @@ AX reads only the focused window and focused element; no transcript is collected
 If this Codex version does not expose its route, selected voice stays unavailable.
 """
 import ctypes as C
+import json
+import os
+from pathlib import Path
 import re
 import subprocess
 import time
@@ -29,6 +32,7 @@ class Accessibility:
         self.cf.CFURLGetTypeID.restype = C.c_ulong
         self.cf.CFURLGetString.argtypes = [C.c_void_p]; self.cf.CFURLGetString.restype = C.c_void_p
         self.cf.CFRelease.argtypes = [C.c_void_p]
+        self.diagnostic = {}
 
     def attr(self, obj, name):
         key = self.cf.CFStringCreateWithCString(None, name.encode(), 0x08000100)
@@ -64,11 +68,22 @@ class Accessibility:
             # Search fields and sidebar links are never a selected composer.
             # Only a focused multiline editor can start dictation. Its own
             # ancestry must expose the selected route; sibling URLs do not count.
-            if not focused or self.text_attr(focused, 'AXRole') != 'AXTextArea':
+            role = self.text_attr(focused, 'AXRole') if focused else ''
+            self.diagnostic = dict(reason='editor_not_focused', focused_role=role, ancestors=[])
+            if not focused or role != 'AXTextArea':
                 return False
+            self.diagnostic['reason'] = 'route_unavailable'
+
             obj = focused
             for _ in range(24):
-                if route_matches(self.text_attr(obj, 'AXURL'), thread_id):
+                url = self.text_attr(obj, 'AXURL')
+                self.diagnostic['ancestors'].append(dict(role=self.text_attr(obj, 'AXRole'),
+                    description=self.text_attr(obj, 'AXDescription')[:160],
+                    identifier=self.text_attr(obj, 'AXIdentifier')[:100],
+                    dom_id=self.text_attr(obj, 'AXDOMIdentifier')[:100],
+                    url=url[:200] if url.startswith(('app://','codex://')) else ''))
+                if route_matches(url, thread_id):
+                    self.diagnostic['reason'] = 'matched'
                     return True
                 parent = self.attr(obj, 'AXParent')
                 if not parent:
@@ -95,6 +110,14 @@ def focus_codex(row, frontmost, post_key, keyspec, ax=None, opener=subprocess.ru
             bundle, pid = frontmost()
             if bundle == 'com.openai.codex' and ax.matches(pid, tid, True):
                 return frontmost() == (bundle, pid)
+        # Written only after a user-triggered selection/voice action. No
+        # transcript values or sibling UI tree are collected.
+        diagnostic = getattr(ax, 'diagnostic', {})
+        if isinstance(ax, Accessibility) and isinstance(diagnostic, dict):
+            output = Path.home() / '.agentpet/task-focus-diagnostic.json'
+            fd = os.open(str(output), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w') as stream:
+                json.dump(diagnostic, stream, ensure_ascii=False)
         return False
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return False

@@ -93,8 +93,10 @@ def read_codex(home, now):
         unread_ok = read.get("version") == 1 and isinstance(unread, list) and all(isinstance(t, str) for t in unread)
         db = sqlite3.connect("file:" + str(home / "sqlite/codex-dev.db") + "?mode=ro", uri=True, timeout=1)
         try:
-            visible = {r[0] for r in db.execute("SELECT thread_id FROM local_thread_catalog "
-                      "WHERE host_id='local' AND missing_candidate=0")}
+            catalog_columns = {r[1] for r in db.execute("PRAGMA table_info(local_thread_catalog)")}
+            display_column = 'display_title' if 'display_title' in catalog_columns else 'NULL'
+            visible = dict(db.execute("SELECT thread_id," + display_column + " FROM local_thread_catalog "
+                      "WHERE host_id='local' AND missing_candidate=0"))
         finally:
             db.close()
         db = sqlite3.connect("file:" + str(home / "state_5.sqlite") + "?mode=ro", uri=True, timeout=1)
@@ -114,7 +116,7 @@ def read_codex(home, now):
                 status = "unknown"
             else:
                 status = rollout_status(path, now)
-            snap["tasks"].append({"title": title or "Untitled", "thread_id": tid,
+            snap["tasks"].append({"title": visible.get(tid) or title or "Untitled", "thread_id": tid,
                 "host": "local", "host_label": "Mac", "state": status,
                 "unread": tid in unread if unread_ok else None, "updated_at": updated_at or 0})
         snap["unread"] = metric(sum(t["unread"] is True for t in snap["tasks"]), "partial") if unread_ok else metric()
