@@ -20,6 +20,7 @@
 #include "pins.h"
 #include "config.h"
 #include "face.h"
+#include "dashboard.h"
 #include "pages.h"
 #include "audio.h"
 #include "ble.h"
@@ -1576,6 +1577,20 @@ static void handleLine(const String& line) {
   }
   if (visitor) return;       // not the owner's link: only hostinfo/claim get through
   lastRx = millis();
+  if (strcmp(t, "dashboard_test") == 0) {
+    if (sessEffState()!=ST_NEEDS_YOU && !listening && !claimShowing()) {
+      const char* action=d["action"]|"";
+      int x=strcmp(action,"quota")==0?108:strcmp(action,"back")==0?110:strcmp(action,"unread")==0?330:230;
+      int y=strcmp(action,"quota")==0?107:strcmp(action,"back")==0?401:strcmp(action,"running")==0?101:130;
+      JsonDocument request;
+      if(dashboardTap(x,y,selected,request) && !request.isNull()) sendJson(request);
+    }
+    return;
+  }
+  if (strcmp(t, "dashboard") == 0 || strcmp(t, "tasks") == 0) {
+    dashboardHandle(d, agentIdxById(d["agent"] | ""), millis());
+    return;
+  }
   if (strcmp(t, "state") == 0) {
     uint8_t prev[N_AGENTS];
     memcpy(prev, agentStates, sizeof(prev));
@@ -2647,7 +2662,7 @@ static bool pinHit(int x, int y) {
   return vx >= LCD_W - PIN_HIT && vy >= LCD_H - PIN_HIT;
 }
 
-// Claude 多会话 top band: y < 110 of the face's view frame, cut
+// Claude 多会话 top band: y < 76 of the face's view frame, cut
 // at x 240 — -1 = left half (previous), +1 = right half (next), 0 = not a
 // session tap. Live only while the row is on screen and the seat on screen
 // owns ≥2 sessions; a hidden row leaves the top as a plain tap (nudge).
@@ -2658,7 +2673,7 @@ static int sessTopHalf(int x, int y) {
   if (!sessActive() || !faceSessRowShown()) return 0;
   int vx, vy;
   pageXY(x, y, vx, vy);
-  if (vy >= 110) return 0;
+  if (vy >= 76) return 0;
   return vx < 240 ? -1 : 1;
 }
 
@@ -2834,14 +2849,22 @@ static void touchPoll() {
         bool rejectHold = effNeeds && (int32_t)(nowMs - tpDownAt) >= 700;
         bool pin = pinHit(tpLastX, tpLastY);
         int half = (pin || rejectHold) ? 0 : sessTopHalf(tpLastX, tpLastY);
-        if (pin) {
+        int dx, dy; pageXY(tpLastX, tpLastY, dx, dy);
+        JsonDocument dashboardRequest;
+        bool dashboardHit = !effNeeds && !pin && !listening &&
+          (int32_t)(setCardUntil-nowMs)<=0 && (int32_t)(profUntil-nowMs)<=0 &&
+          (int32_t)(sendUntil-nowMs)<=0 && !claimShowing() &&
+          dashboardTap(dx,dy,selected,dashboardRequest);
+        if (dashboardHit) {
+          if (!dashboardRequest.isNull()) sendJson(dashboardRequest);
+        } else if (pin) {
           // corner pin wins the tap before every other face action (doc/06):
           // status toast, double-tap profile and the approve bubble all live
           // in the middle, so the corner is unambiguously about pinning.
           setPinned(!pinned, PAGE_FACE);
         } else if (half) {
           // Claude 多会话: the session row is showing, so the top
-          // band (y < 110) steps the list — left half back, right half on.
+          // band (y < 76) steps the list — left half back, right half on.
           // Not a "tap" for the double-tap clock: two quick taps here are two
           // steps, and a tap on the face right after must not open the card.
           sessStep(half);

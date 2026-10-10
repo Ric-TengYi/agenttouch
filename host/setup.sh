@@ -119,7 +119,7 @@ fi
 # ---------------------------------------------------------------------------
 step "3. host 文件 → $DEPLOY"
 [ $CHECK = 1 ] || mkdir -p "$DEPLOY"
-for f in agentpet_host.py almanac_bank.json agent_setup.md gen_almanac_font.py pet codex_notify.sh codex_permission_hook.sh; do
+for f in dashboard.py dashboard_service.py codex_rpc.py claude_statusline.py agentpet_host.py almanac_bank.json agent_setup.md gen_almanac_font.py pet codex_notify.sh codex_permission_hook.sh; do
   if cmp -s "$SRC/$f" "$DEPLOY/$f"; then ok "$f 一致"
   elif doit "拷 $f"; then
     cp "$SRC/$f" "$DEPLOY/$f.tmp" && mv -f "$DEPLOY/$f.tmp" "$DEPLOY/$f" && did "$f"
@@ -394,3 +394,8 @@ if [ ${#MANUAL[@]} -gt 0 ]; then
 fi
 echo
 [ $FAIL = 0 ] && echo "setup: 完成" || { echo "setup: 有失败项（上面 ✗）"; exit 1; }
+
+# Preserve any existing Claude statusline; add read-only quota forwarding.
+if [ "$CHECK" != 1 ]; then
+  /usr/bin/python3 "$DEPLOY/claude_statusline.py" --install "$HOME/.claude/settings.json" "$DEPLOY"
+fi

@@ -143,3 +143,15 @@ host 各模块使用标准库 dataclass 和 dict，接口类型在 `dashboard.py
 推荐 Native：在本会话逐项实施，先完成 Task 1 关卡，再顺序推进；最后安排一次独立整分支审阅。这里的 Native 是计划的执行方式，代码执行本身仍使用 `superpowers:executing-plans`。也可选择 Subagent-driven，以每项实现和审阅分别交接；需要用户明确选择后才开始。
 
 执行方式已选 Native。2026-10-10 已建立实施 worktree，Task 1 probe 已运行，接入关卡仍阻塞；证据见 `docs/superpowers/evidence/2026-10-10-codex-dashboard-source.md`。Task 2–7 未开始。阶段完成只更新对应 checkbox，跨主机入口阻塞时不把后续功能写成已完成。
+
+## 2026-10-10 可验证部分
+用户选择先实现可验证部分。Codex 使用当前登录身份、未归档本地目录与原生未读的交集；生命周期仅统计新鲜且明确的事件，计数以 ≥ 标记下界。远程和云端覆盖 partial，不宣称全量。Claude 使用现有 session 状态规则，原生未读不可用。额度使用已有 daemon 只读 RPC / Claude statusline，缺失或过期显示未知。
+
+### 可验证部分状态
+- [x] 本地适配、账号隔离、额度、有限生命周期、快照质量与分页
+- [x] Host 服务和可重复 Claude statusline 安装
+- [x] 固件圆环、同一行数量、列表刷新及模态优先级
+- [x] 401项测试、独立审查、USB写入与真实设备截图/麦克风检查
+- [ ] 完整远程/云端及真实 Claude 额度验收（后续阶段）
+
+用户最新显示要求：主界面删除 7日剩余/本地部分，数量用冒号且不显示 >=；partial 仍在协议和列表页保留。实现集中在 dashboard.py/dashboard_service.py/codex_rpc.py，原计划模块拆分按本阶段范围简化。见 evidence/2026-10-10-agent-dashboard-partial.md。

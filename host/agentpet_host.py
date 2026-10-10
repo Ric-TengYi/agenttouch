@@ -17,6 +17,9 @@ Run:  python3 agentpet_host.py
 Debug: curl http://127.0.0.1:8788/state
 """
 import asyncio
+from dashboard_service import DashboardService
+from dashboard import encode as dashboard_encode
+dashboard_service = DashboardService()
 import base64
 import ctypes
 import ctypes.util
@@ -2978,13 +2981,19 @@ def handle_board_msg(raw, reply):
     if not isinstance(m, dict):          # "[1,2]" / "42" are valid JSON, not messages
         return
     t = m.get("t")
-    if t == "ping":
+    if t == "tasks_get":
+        reply(dashboard_encode(dashboard_service.store.page(
+            str(m.get("agent", "")), str(m.get("filter", "")),
+            m.get("cursor", ""), m.get("request_id", ""), time.time())))
+    elif t == "ping":
         # the BOARD's own heartbeat, not our /test/rtt probe:
         # that one goes host -> board and comes back as {"t":"pong"}
         board_stat_update(m)
         reply(b'{"t":"pong"}\n')
     elif t == "hello":
         log("board hello:", m)
+        for agent in ("codex", "claude"):
+            reply(dashboard_encode(dashboard_service.store.summary(agent, time.time())))
         board_hello_at = time.time()
         _board_min_floor = None       # a rebooted board starts its own descent
         board_stat_update(m)
@@ -7647,7 +7656,10 @@ class HookHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/settings":
+        if self.path == "/dashboard":
+            self._ok(json.dumps({a: dashboard_service.store.summary(a, time.time())
+                                for a in ("codex", "claude")}).encode())
+        elif self.path == "/settings":
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
@@ -7863,6 +7875,11 @@ class HookHandler(BaseHTTPRequestHandler):
             for ident, frame in sys._current_frames().items():
                 out[names.get(ident, str(ident))] = traceback.format_stack(frame)[-6:]
             self._ok(json.dumps(out, ensure_ascii=False, indent=1).encode())
+        elif self.path.startswith("/test/dashboard/"):
+            action = self.path.rsplit("/", 1)[1]
+            if action in ("quota", "running", "unread", "back"):
+                push_msg({"t": "dashboard_test", "action": action})
+            self._ok()
         elif self.path.startswith("/test/select/"):
             # pretend the board swiped to <agent>: runs the real select path
             # (active seat, board lockout, debounced focus follow)
@@ -8236,6 +8253,10 @@ class HookHandler(BaseHTTPRequestHandler):
             payload = json.loads(raw or b"{}")
         except ValueError:
             payload = {}
+        if self.path == "/dashboard/quota/claude":
+            dashboard_service.accept_claude_quota(payload)
+            self._ok()
+            return
         if self.path == "/settings/save":
             self._ok(json.dumps(save_settings(payload), ensure_ascii=False).encode())
             return
@@ -8350,6 +8371,12 @@ def main():
     load_report()
     sess_load()                       # Claude sessions survive a host restart
     np_apply()                        # media-control listener
+    def dashboard_sessions():
+        now = time.time()
+        with lock:
+            return {sid: dict(row, state=sess_state(row, now))
+                    for sid, row in claude_sessions.items()}
+    dashboard_service.start(dashboard_sessions, push_raw)
     threading.Thread(target=watcher_loop, daemon=True).start()
     threading.Thread(target=ble_thread, daemon=True).start()
     threading.Thread(target=power_thread, daemon=True).start()   # links down before a Mac sleep
