@@ -250,6 +250,7 @@ static uint32_t sendUntil = 0;
 // it must land where the words did, even though the bubble is tapped later
 // (on the face page) and the seat may have moved meanwhile.
 static bool voiceToFront = false;
+static String voiceTarget;
 static char voiceSid[9] = "";          // the session that utterance went to
 static uint32_t demoStart       = 0;   // != 0 while the 8-face demo runs
 static int8_t   demoFace        = -1;  // -1 = full tour, else one fixed face
@@ -1580,14 +1581,16 @@ static void handleLine(const String& line) {
   if (strcmp(t, "dashboard_test") == 0) {
     if (sessEffState()!=ST_NEEDS_YOU && !listening && !claimShowing()) {
       const char* action=d["action"]|"";
+      if(strcmp(action,"state")==0) { JsonDocument response; dashboardInspect(response); response["id"]=d["id"]; sendJson(response); return; }
+      if(strcmp(action,"scroll")==0) { dashboardScroll(1); return; }
       int x=strcmp(action,"quota")==0?108:strcmp(action,"back")==0?110:strcmp(action,"unread")==0?330:230;
-      int y=strcmp(action,"quota")==0?107:strcmp(action,"back")==0?401:strcmp(action,"running")==0?101:130;
+      int y=strcmp(action,"more")==0?365:strcmp(action,"quota")==0?107:strcmp(action,"back")==0?401:strcmp(action,"running")==0?101:130;
       JsonDocument request;
       if(dashboardTap(x,y,selected,request) && !request.isNull()) sendJson(request);
     }
     return;
   }
-  if (strcmp(t, "dashboard") == 0 || strcmp(t, "tasks") == 0) {
+  if (strcmp(t, "dashboard") == 0 || strcmp(t, "tasks") == 0 || strcmp(t,"task_selected")==0 || strcmp(t,"task_status")==0) {
     dashboardHandle(d, agentIdxById(d["agent"] | ""), millis());
     return;
   }
@@ -2704,7 +2707,7 @@ static void touchPoll() {
     }
     // petting = back-and-forth rubbing, either axis, lifts allowed: the
     // finger reversing direction is what a deliberate swipe never does
-    if (tpWasDown && shownPage == PAGE_FACE && !pickedUp) {
+    if (tpWasDown && shownPage == PAGE_FACE && !pickedUp && !dashboardOpen()) {
       int sx = x - tpLastX, sy = y - tpLastY;
       int8_t dir = 0;
       if      (abs(sx) > 5 && abs(sx) >= abs(sy)) dir = sx > 0 ? 1 : -1;
@@ -2737,7 +2740,7 @@ static void touchPoll() {
     // own long-press (reject), so the hold is inert while needs_you is up
     // (the bubble's own rule: the current session's state).
     if (tpWasDown && !tpConsumed && !pendH && !pendV && !demoStart &&
-        shownPage == PAGE_FACE && !listening &&
+        shownPage == PAGE_FACE && !listening && !dashboardOpen() &&
         sessEffState() != ST_NEEDS_YOU &&
         (int32_t)(petUntil - millis()) <= 0 &&
         (int32_t)(setCardUntil - millis()) <= 0 && !claimShowing() &&
@@ -2821,7 +2824,14 @@ static void touchPoll() {
         }
       }
     } else if (shownPage == PAGE_FACE) {
-      if (wasPetting) {
+      if (dashboardOpen() && !listening && sessEffState()!=ST_NEEDS_YOU) {
+        if (vv) dashboardScroll(vdy<0?1:-1);
+        else if (!vh && !hswipe && !vswipe) {
+          int tx,ty; pageXY(tpLastX,tpLastY,tx,ty); JsonDocument request;
+          dashboardTap(tx,ty,selected,request);
+          if(!request.isNull()) { sendJson(request); sendUntil=0; }
+        }
+      } else if (wasPetting) {
         // lifting off after a petting session: no swipe/tap side effects
       } else if (vh) {
         // swipe left = next seat to the right (executes deferred, see above).
@@ -2872,7 +2882,8 @@ static void touchPoll() {
           sendUntil = 0;
           JsonDocument kd;      // same destination the words went to
           kd["t"] = "key"; kd["k"] = "enter";
-          if (voiceToFront) kd["to"] = "front";
+          if (voiceTarget.length()) { kd["target"]=voiceTarget; kd["agent"]=AGENTS[selected].id; }
+          else if (voiceToFront) kd["to"] = "front";
           else if (voiceSid[0]) kd["sid"] = voiceSid;   // the session it was said to
           sendJson(kd);
           audioPlay(SND_DONE);
@@ -3198,6 +3209,7 @@ void loop() {
 
   pmuKeyScan(bPwr); btnScan(bIo18); btnScan(bBoot);   // middle key lives on the PMU
   if (bPwr.pressed || bIo18.pressed || bBoot.pressed) noteActivity();
+  { JsonDocument request; if(dashboardPoll(request)) sendJson(request); }
   tcpPump();                           // finish any parked TCP remainder before new writers
   micDrain();
   bleTestPoll();
@@ -3211,7 +3223,7 @@ void loop() {
   // (10 s at most) hard-cuts the rail no matter what REG 22H[1] says — it is
   // EFUSE-locked on this part (measured: rst=poweron at ~10 s with the bit
   // cleared). A dictation key that kills the board mid-sentence is no key.
-  if (bIo18.pressed) {
+  if (bIo18.pressed && (!dashboardOpen() || dashboardVoiceToken().length())) {
     listening = true;
     sendUntil = 0;                     // new dictation: retire the old bubble
     audioPlay(SND_VOICE_ON);
@@ -3219,13 +3231,15 @@ void loop() {
     d["t"] = "voice"; d["a"] = "start"; d["agent"] = AGENTS[selected].id;
     // shownPage is what is REALLY on screen this frame, so a face carried in
     // the hand (or grabbed by needs_you) still talks to its own seat.
-    voiceToFront = shownPage != PAGE_FACE;
+    voiceTarget = dashboardVoiceToken();
+    voiceToFront = !voiceTarget.length() && shownPage != PAGE_FACE;
+    if (voiceTarget.length()) d["target"] = voiceTarget;
     if (voiceToFront) d["to"] = "front";
     // face-page dictation goes to the session on screen; latched like
     // voiceToFront so the send bubble's Return lands in the same tab even if
     // the row moves on before the tap. Desk pages stay "front" only.
     voiceSid[0] = 0;
-    if (!voiceToFront && sessActive()) {
+    if (!voiceToFront && !voiceTarget.length() && sessActive()) {
       strlcpy(voiceSid, sessList[sessCur].id, sizeof(voiceSid));
       d["sid"] = voiceSid;
     }
@@ -3234,12 +3248,13 @@ void loop() {
     d["link"] = micLink == MICLINK_BLE ? "ble" : micLink == MICLINK_TCP ? "tcp" : "none";
     sendJson(d);
   }
-  if (bIo18.released) {
+  if (bIo18.released && listening) {
     listening = false;
     sendUntil = now + 6000;            // arms the tap-to-send bubble
     audioPlay(SND_VOICE_OFF);
     JsonDocument d;
     d["t"] = "voice"; d["a"] = "stop"; d["agent"] = AGENTS[selected].id;
+    if(voiceTarget.length()) d["target"] = voiceTarget;
     sendJson(d);
     if (micOnTalk) audioMicStop();
   }

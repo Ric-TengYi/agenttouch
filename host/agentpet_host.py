@@ -20,6 +20,82 @@ import asyncio
 from dashboard_service import DashboardService
 from dashboard import encode as dashboard_encode
 dashboard_service = DashboardService()
+from task_control import TaskControl, SelectedVoice
+from task_focus import focus_codex
+task_control = TaskControl(dashboard_service.store)
+
+
+def selected_focus(row):
+    if row['agent'] == 'claude':
+        return focus_session_fast(row['thread_id'], exact_only=True) in ('warp', 'terminal', 'iterm', 'ghostty')
+    # Re-read identity immediately before native focus, rather than trusting
+    # the background collector's five-second-old account snapshot.
+    from dashboard import identity
+    try:
+        from pathlib import Path
+        if identity(Path.home() / '.codex', time.time())[0] != dashboard_service.store.get('codex', time.time())['identity']:
+            return False
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    ok = focus_codex(row, selected_frontmost, post_key, FOCUS_KEYS.get('codex'))
+    try:
+        return ok and identity(Path.home() / '.codex', time.time())[0] == dashboard_service.store.get('codex', time.time())['identity']
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def selected_frontmost():
+    # NSWorkspace.frontmostApplication is stale without an AppKit main loop.
+    # Use the same fresh window-server query as existing focus insurance.
+    try:
+        import Quartz
+        from AppKit import NSRunningApplication
+        with objc_pool():
+            windows = Quartz.CGWindowListCopyWindowInfo(
+                Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements,
+                Quartz.kCGNullWindowID)
+            for window in windows or []:
+                if window.get('kCGWindowLayer', 1) == 0:
+                    pid = int(window.get('kCGWindowOwnerPID', 0))
+                    app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+                    return (str(app.bundleIdentifier()), pid) if app else ('', 0)
+    except Exception:
+        pass
+    return ('', 0)
+
+
+def selected_begin():
+    _mic_reset()
+    with _mic_lock:
+        _mic['session_board'] = True
+    return mic_sink_begin()
+
+
+def selected_key(down):
+    if not down:
+        with _mic_lock:
+            board_mic = _mic['session_board']
+        if board_mic:
+            time.sleep(MIC_TAIL_S)
+    voice_key(down)
+    if down:
+        with _mic_lock:
+            board_mic = _mic['session_board']
+        if board_mic:
+            mic_sink_open_gate()
+
+
+def selected_end():
+    with _mic_lock:
+        board_mic = _mic['session_board']
+        _mic['session_board'] = False
+    if board_mic:
+        time.sleep(.5)
+        mic_sink_end()
+
+
+selected_voice = SelectedVoice(task_control, selected_focus, selected_begin,
+                               selected_key, selected_end, lambda: post_key('enter'))
 import base64
 import ctypes
 import ctypes.util
@@ -2205,7 +2281,7 @@ def _focus_ghostty(cwd, title):
     return ok and out == "ok"
 
 
-def focus_session(sid):
+def focus_session(sid, exact_only=False):
     """Bring session `sid`'s tab to the front. Returns the kind that worked:
     warp / terminal / iterm / ghostty = that exact tab, app = only the app,
     None = nothing to raise."""
@@ -2225,10 +2301,10 @@ def focus_session(sid):
             done = "iterm" if _focus_iterm(arg) else None
         elif kind == "ghostty":
             done = "ghostty" if _focus_ghostty(arg, rec.get("title") or "") else None
-        if not done and rec.get("bundle"):
+        if not done and not exact_only and rec.get("bundle"):
             subprocess.run(["open", "-b", rec["bundle"]], capture_output=True, timeout=3)
             done = "app"
-        elif not done and FOCUS_APPS.get("claude"):
+        elif not done and not exact_only and FOCUS_APPS.get("claude"):
             subprocess.run(["open", "-a", FOCUS_APPS["claude"]], capture_output=True, timeout=3)
             done = "app"
     except subprocess.TimeoutExpired:
@@ -2240,7 +2316,7 @@ def focus_session(sid):
     return done
 
 
-def focus_session_fast(sid):
+def focus_session_fast(sid, exact_only=False):
     """focus_session before dictation / the send Enter: always re-assert the
     tab, but pay the settle wait only when it was probably not in front (the
     voice key must not gain latency when nothing moves)."""
@@ -2248,7 +2324,7 @@ def focus_session_fast(sid):
         bundle = (claude_sessions.get(sid) or {}).get("bundle")
     name = (_bundle_names.get(bundle) or "").lower()
     known = _sess_front.get("sid") == sid and name and name in _frontmost_app().lower()
-    done = focus_session(sid)
+    done = focus_session(sid, exact_only=exact_only)
     time.sleep(0.1 if known else 0.35)
     return done
 
@@ -2984,13 +3060,50 @@ def handle_board_msg(raw, reply):
     if t == "tasks_get":
         reply(dashboard_encode(dashboard_service.store.page(
             str(m.get("agent", "")), str(m.get("filter", "")),
-            m.get("cursor", ""), m.get("request_id", ""), time.time())))
+            m.get("cursor", ""), m.get("request_id", ""), time.time(), m.get("read_limit", 5))))
+    elif t == "task_select":
+        agent = str(m.get('agent', ''))
+        previous = task_control.target(str(m.get('target', ''))) if m.get('target') else None
+        handle = previous['handle'] if previous and previous['agent'] == agent else str(m.get('handle', ''))
+        result = task_control.select(agent, handle)
+        result['request_id'] = str(m.get('request_id', ''))[:24]
+        reply(dashboard_encode(result))
+        if result.get('token'):
+            token = result['token']
+            def open_selected():
+                selected_voice.cancel()
+                ok = task_control.run(token, selected_focus, lambda row: None)
+                reply(dashboard_encode(dict(t='task_status', v=1, agent=agent, token=token,
+                    error='' if ok else 'focus_unverified', phase='selected')))
+            inject(open_selected)
+    elif t == "task_cancel":
+        task_control.clear()
+        inject(selected_voice.cancel)
+    elif t == "voice" and 'target' in m:
+        token = str(m.get('target', ''))
+        agent = str(m.get('agent', ''))
+        def selected_dictation():
+            start = m.get('a') == 'start'
+            ok = selected_voice.start(token, VOICE_SOURCE == 'board' and bool(m.get('mic'))) if start else selected_voice.stop(token)
+            reply(dashboard_encode(dict(t='task_status', v=1, agent=agent, token=token,
+                error='' if ok else 'focus_unverified', phase='voice_start' if start else 'voice_stop')))
+        inject(selected_dictation)
+    elif t == "key" and 'target' in m:
+        token = str(m.get('target', ''))
+        agent = str(m.get('agent', ''))
+        def selected_send():
+            ok = m.get('k') == 'enter' and selected_voice.send(token)
+            reply(dashboard_encode(dict(t='task_status', v=1, agent=agent, token=token,
+                error='' if ok else 'focus_unverified', phase='sent')))
+        inject(selected_send)
     elif t == "ping":
         # the BOARD's own heartbeat, not our /test/rtt probe:
         # that one goes host -> board and comes back as {"t":"pong"}
         board_stat_update(m)
         reply(b'{"t":"pong"}\n')
     elif t == "hello":
+        task_control.clear()
+        inject(selected_voice.cancel)
         log("board hello:", m)
         for agent in ("codex", "claude"):
             reply(dashboard_encode(dashboard_service.store.summary(agent, time.time())))
@@ -3047,7 +3160,7 @@ def handle_board_msg(raw, reply):
         threading.Thread(target=media_cmd, args=(m.get("cmd", ""),), daemon=True).start()
     elif t == "np_miss":                 # the board wants a cover that is not on the card
         threading.Thread(target=np_miss, args=(m.get("cover", ""),), daemon=True).start()
-    elif t in ("fack", "fls", "fcat", "frm", "ota", "spk", "pong", "plst"):   # answers to SD file / OTA / speak / rtt / player endpoints
+    elif t in ("fack", "fls", "fcat", "frm", "ota", "spk", "pong", "plst", "dashboard_state"):   # answers to SD file / OTA / speak / rtt / player endpoints
         _park_reply(m)
     elif t == "skins":            # who wears what, after a change on the card or from /test/skin
         if isinstance(m.get("skins"), dict):   # same key as on the hello
@@ -7877,9 +7990,14 @@ class HookHandler(BaseHTTPRequestHandler):
             self._ok(json.dumps(out, ensure_ascii=False, indent=1).encode())
         elif self.path.startswith("/test/dashboard/"):
             action = self.path.rsplit("/", 1)[1]
-            if action in ("quota", "running", "unread", "back"):
-                push_msg({"t": "dashboard_test", "action": action})
-            self._ok()
+            if action == 'state':
+                rid = _new_rid()
+                push_board(dict(t='dashboard_test', action='state', id=rid))
+                self._ok(json.dumps(wait_reply('dashboard_state', rid, 3) or dict(error='timeout')).encode())
+            else:
+                if action in ("quota", "running", "unread", "back", "more", "scroll"):
+                    push_board({"t": "dashboard_test", "action": action})
+                self._ok()
         elif self.path.startswith("/test/select/"):
             # pretend the board swiped to <agent>: runs the real select path
             # (active seat, board lockout, debounced focus follow)

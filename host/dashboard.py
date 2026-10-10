@@ -99,11 +99,13 @@ def read_codex(home, now):
             db.close()
         db = sqlite3.connect("file:" + str(home / "state_5.sqlite") + "?mode=ro", uri=True, timeout=1)
         try:
-            rows = db.execute("SELECT id,title,rollout_path,source,creator_account_id,creator_user_id "
+            columns = {r[1] for r in db.execute("PRAGMA table_info(threads)")}
+            updated = "updated_at" if "updated_at" in columns else "0"
+            rows = db.execute("SELECT id,title,rollout_path,source,creator_account_id,creator_user_id," + updated + " "
                               "FROM threads WHERE archived=0").fetchall()
         finally:
             db.close()
-        for tid, title, path, source, owner_account, owner_user in rows:
+        for tid, title, path, source, owner_account, owner_user, updated_at in rows:
             if tid not in visible or "subagent" in str(source):
                 continue
             if owner_account != account or owner_user != user:
@@ -114,7 +116,7 @@ def read_codex(home, now):
                 status = rollout_status(path, now)
             snap["tasks"].append({"title": title or "Untitled", "thread_id": tid,
                 "host": "local", "host_label": "Mac", "state": status,
-                "unread": tid in unread if unread_ok else None})
+                "unread": tid in unread if unread_ok else None, "updated_at": updated_at or 0})
         snap["unread"] = metric(sum(t["unread"] is True for t in snap["tasks"]), "partial") if unread_ok else metric()
         known = [t for t in snap["tasks"] if t["state"] != "unknown"]
         snap["running"] = metric(sum(t["state"] == "running" for t in known), "partial") if known else metric()
@@ -154,7 +156,7 @@ def read_claude(sessions, quota, now):
             continue
         status = {"working": "running", "needs_you": "waiting", "idle": "idle", "done": "idle"}.get(row.get("state"), "unknown")
         snap["tasks"].append({"title": row.get("title") or row.get("cwd") or "Claude session",
-            "thread_id": sid, "host": "local", "host_label": "Mac", "state": status, "unread": None})
+            "thread_id": sid, "host": "local", "host_label": "Mac", "state": status, "unread": None, "updated_at": row.get("ts", 0)})
     snap["running"] = metric(sum(t["state"] == "running" for t in snap["tasks"]), "ok")
     snap["waiting"] = metric(sum(t["state"] == "waiting" for t in snap["tasks"]), "ok")
     snap["coverage"] = {"quality": "ok", "reason": "claude_local_sessions"}
@@ -207,10 +209,12 @@ class DashboardStore:
         snap.pop("identity", None)
         return dict(snap, t="dashboard", v=1)
 
-    def page(self, agent, filter_name, cursor, request_id, now):
+    def page(self, agent, filter_name, cursor, request_id, now, read_limit=5):
         snap = self.get(agent, now)
         result = {"t": "tasks", "v": 1, "agent": agent, "generation": snap["generation"],
                   "request_id": str(request_id)[:24], "list": [], "next_cursor": "", "error": ""}
+        if filter_name == "catalog":
+            return self.catalog(snap, cursor, request_id, now, read_limit)
         if filter_name not in ("unread", "running"):
             result["error"] = "invalid_filter"
             return result
@@ -236,6 +240,47 @@ class DashboardStore:
         if offset + len(result["list"]) < len(tasks):
             result["next_cursor"] = "%s:%s:%s" % (snap["generation"], filter_name, offset + len(result["list"]))
         result["complete"] = snap["coverage"]["quality"] == "ok"
+        return result
+
+    def catalog(self, snap, cursor, request_id, now, read_limit):
+        result = {"t": "tasks", "v": 1, "agent": snap["agent"], "generation": snap["generation"],
+                  "request_id": str(request_id)[:24], "list": [], "next_cursor": "", "error": ""}
+        if not snap["identity"] or snap.get("error") == "local_source_unavailable" or now - snap["observed_at"] > 30:
+            result["error"] = "source_unavailable"
+            return result
+        try:
+            limit = max(5, min(500, int(read_limit)))
+        except (ValueError, TypeError):
+            result["error"] = "invalid_limit"
+            return result
+        offset = 0
+        if cursor:
+            try:
+                generation, kind, cursor_limit, offset_text = str(cursor).split(":")
+                offset = int(offset_text)
+                if int(generation) != snap["generation"] or kind != "catalog" or int(cursor_limit) != limit or offset < 0:
+                    raise ValueError()
+            except (ValueError, TypeError):
+                result["error"] = "stale_cursor"
+                return result
+        groups = {"running": [], "unread": [], "read": [], "unknown": []}
+        for task in snap["tasks"]:
+            kind = "running" if task["state"] == "running" else "unread" if task["unread"] is True or task["state"] == "waiting" else "read" if task["unread"] is False else "unknown"
+            groups[kind].append(dict(task, kind=kind))
+        for group in groups.values():
+            group.sort(key=lambda row: (row.get("updated_at", 0), row["thread_id"]), reverse=True)
+        # Claude has no native read-state source. Show recent sessions explicitly
+        # as unknown, never invent a read confirmation.
+        recent = groups["read"] + groups["unknown"]
+        tasks = groups["running"] + groups["unread"] + recent[:limit]
+        result.update(total=len(tasks), has_more_read=len(recent) > limit,
+                      complete=snap["coverage"]["quality"] == "ok")
+        for row in tasks[offset:offset + 4]:
+            item = {key: row[key] for key in ("handle", "host_label", "state", "unread", "kind")}
+            item["title"] = row["title"][:180]
+            result["list"].append(item)
+        if offset + len(result["list"]) < len(tasks):
+            result["next_cursor"] = "%s:catalog:%s:%s" % (snap["generation"], limit, offset + len(result["list"]))
         return result
 
     def resolve(self, agent, handle, now):
