@@ -56,12 +56,12 @@ host 各模块使用标准库 dataclass 和 dict，接口类型在 `dashboard.py
 
 **Interfaces:** Produces 支持版本、身份选择、完整目录分页、真实运行状态、额度请求和通知的已验证入口；该结果决定 Task 2 的传输实现，不预设私有 IPC 地址。
 
-- [ ] Step 1：执行时创建/复用独立 worktree，读取 spec 和适用 AGENTS.md；记录基线 commit、桌面版本和来源覆盖，不打印认证数据。
-- [ ] Step 2：检查本机安装代码、可用 app-server schema 与桌面只读连接入口，区分新进程状态和已有桌面状态，记录支持的查询及认证方式。
-- [ ] Step 3：写只读 probe，设置单次请求 5 秒截止时间；输出版本、目录数量、状态计数、来源覆盖和能力错误码，不输出对话正文或凭据。
+- [x] Step 1：执行时创建/复用独立 worktree，读取 spec 和适用 AGENTS.md；记录基线 commit、桌面版本和来源覆盖，不打印认证数据。
+- [x] Step 2：检查本机安装代码、可用 app-server schema 与桌面只读连接入口，区分新进程状态和已有桌面状态，记录支持的查询及认证方式。
+- [x] Step 3：写只读 probe，设置单次请求 5 秒截止时间；输出版本、目录数量、状态计数、来源覆盖和能力错误码，不输出对话正文或凭据。
 - [ ] Step 4：通过后台可持续调用的入口取得全部分页目录与运行状态；与桌面快照逐项核对本机、远程、云端，至少覆盖一次运行→等待/完成转换，记录实测或缺少样本。
 - [ ] Step 5：验证原生未读的当前身份和执行主机映射，以及七日窗口读取。确认 probe 不更改任务、原生文件和应用包。
-- [ ] Step 6：形成 pass / blocked 证据。无法取得跨主机真实状态时停止 Task 2–7，报告替代桥接方案；缺少云端/远程样本时不得把该来源标为验收通过。
+- [x] Step 6：形成 pass / blocked 证据。无法取得跨主机真实状态时停止 Task 2–7，报告替代桥接方案；缺少云端/远程样本时不得把该来源标为验收通过。
 - [ ] Step 7：通过后提交 probe 与去敏证据：`git commit -m "docs: verify Codex dashboard data sources"`。
 
 ## Task 2: 可测试的数据适配器
@@ -142,4 +142,4 @@ host 各模块使用标准库 dataclass 和 dict，接口类型在 `dashboard.py
 
 推荐 Native：在本会话逐项实施，先完成 Task 1 关卡，再顺序推进；最后安排一次独立整分支审阅。这里的 Native 是计划的执行方式，代码执行本身仍使用 `superpowers:executing-plans`。也可选择 Subagent-driven，以每项实现和审阅分别交接；需要用户明确选择后才开始。
 
-本计划尚未执行。用户确认计划并选择执行方式后，才开始创建实施 worktree、probe 或产品代码。阶段完成只更新对应 checkbox，跨主机入口阻塞时不把后续功能写成已完成。
+执行方式已选 Native。2026-10-10 已建立实施 worktree，Task 1 probe 已运行，接入关卡仍阻塞；证据见 `docs/superpowers/evidence/2026-10-10-codex-dashboard-source.md`。Task 2–7 未开始。阶段完成只更新对应 checkbox，跨主机入口阻塞时不把后续功能写成已完成。
