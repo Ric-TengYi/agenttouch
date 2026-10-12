@@ -17,6 +17,184 @@ Run:  python3 agentpet_host.py
 Debug: curl http://127.0.0.1:8788/state
 """
 import asyncio
+from pathlib import Path
+from dashboard_service import DashboardService
+from dashboard import encode as dashboard_encode
+dashboard_service = DashboardService()
+from task_control import TaskControl, SelectedVoice
+from task_focus import focus_codex
+task_control = TaskControl(dashboard_service.store)
+dashboard_last_touch = {}
+
+
+def selected_focus(row):
+    if row['agent'] == 'claude':
+        return focus_session_fast(row['thread_id'], exact_only=True) in ('warp', 'terminal', 'iterm', 'ghostty')
+    if not selected_identity(row):
+        return False
+    # User-triggered navigation only. Voice targets our own preview window;
+    # User-requested navigation uses a stable conversation ID.
+    import subprocess
+    import uuid
+    try:
+        tid = row['thread_id']
+        if str(uuid.UUID(tid)) != tid:
+            return False
+        return subprocess.run(['open', 'codex://threads/' + tid],
+            timeout=5, capture_output=True).returncode == 0 and selected_identity(row)
+    except (ValueError, OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def selected_identity(row):
+    from dashboard import identity
+    from pathlib import Path
+    try:
+        selected = task_control.selected
+        return (selected is not None and selected[1] == row['agent'] and
+                selected[3] == row['thread_id'] and
+                identity(Path.home() / '.codex', time.time())[0] == selected[2])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def selected_frontmost():
+    # NSWorkspace.frontmostApplication is stale without an AppKit main loop.
+    # Use the same fresh window-server query as existing focus insurance.
+    try:
+        import Quartz
+        from AppKit import NSRunningApplication
+        with objc_pool():
+            windows = Quartz.CGWindowListCopyWindowInfo(
+                Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements,
+                Quartz.kCGNullWindowID)
+            for window in windows or []:
+                if window.get('kCGWindowLayer', 1) == 0:
+                    pid = int(window.get('kCGWindowOwnerPID', 0))
+                    app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+                    return (str(app.bundleIdentifier()), pid) if app else ('', 0)
+    except Exception:
+        pass
+    return ('', 0)
+
+
+def selected_begin():
+    _mic_reset()
+    with _mic_lock:
+        _mic['session_board'] = True
+    return mic_sink_begin()
+
+
+def selected_key(down):
+    if not down:
+        with _mic_lock:
+            board_mic = _mic['session_board']
+        if board_mic:
+            time.sleep(MIC_TAIL_S)
+    voice_key(down)
+    if down:
+        with _mic_lock:
+            board_mic = _mic['session_board']
+        if board_mic:
+            mic_sink_open_gate()
+
+
+def selected_end():
+    with _mic_lock:
+        board_mic = _mic['session_board']
+        _mic['session_board'] = False
+    if board_mic:
+        time.sleep(.5)
+        mic_sink_end()
+
+
+selected_voice = SelectedVoice(task_control, selected_focus, selected_begin,
+                               selected_key, selected_end, lambda: post_key('enter'))
+from mac_performance import PerformanceService
+mac_performance_service=PerformanceService()
+from preview_control import PreviewVoice, PreviewWindow
+from codex_delivery import send_preview
+def codex_native_begin():
+    # Codex explicitly selects BlackHole: do not change macOS default input.
+    _mic_reset()
+    with _mic_lock:
+        _mic['session_board'] = True
+    return mic_sink_proc() is not None
+
+
+def codex_native_key(down):
+    global voice_down
+    if not down:
+        with _mic_lock:
+            board_mic = _mic['session_board']
+        if board_mic:
+            time.sleep(MIC_TAIL_S)
+    try:
+        codex_native_hold.key(down)
+        voice_down = bool(down)
+        if down:
+            with _mic_lock:
+                board_mic = _mic['session_board']
+            if board_mic:
+                mic_sink_open_gate()
+        log('codex native dictation: Control+M', 'DOWN' if down else 'UP')
+    except Exception:
+        try:
+            if down and codex_native_hold.down:
+                codex_native_hold.cancel()
+        finally:
+            voice_down = False
+        raise
+
+
+def codex_native_cancel():
+    global voice_down
+    try:
+        codex_native_hold.cancel()
+    finally:
+        voice_down = False
+
+
+codex_preview = PreviewVoice(task_control, PreviewWindow(), selected_identity,
+                             codex_native_begin, codex_native_key, selected_end,
+                             send_preview, cancel_key=codex_native_cancel)
+
+def selected_composer_focus(row):
+    if not selected_focus(row):
+        return False
+    # The native in-app dictation hook inserts into its own composer. Give
+    # user-requested navigation time to mount that conversation's editor.
+    time.sleep(.5)
+    return selected_identity(row)
+
+from composer_control import ComposerVoice
+from draft_preview import DraftSource
+def submit_codex_composer(row):
+    # Only called for an explicit device Send after native dictation release.
+    # Identity/target are checked again under TaskControl's lock by the caller.
+    # Reopening the selected URI is handled by selected_composer_focus.
+    if not selected_identity(row) or front_agent(_frontmost_app() or '') != 'codex':
+        return False
+    post_key('enter')
+    return True  # keyboard dispatch only; Codex acceptance needs user verification
+
+codex_composer = ComposerVoice(task_control, selected_composer_focus,
+                              selected_identity, codex_native_begin,
+                              codex_native_key, selected_end, codex_native_cancel,
+                              submit=submit_codex_composer, drafts=DraftSource(Path.home()/'.codex'))
+
+
+def cancel_selected_voice():
+    selected_voice.cancel()
+    codex_preview.cancel()
+    codex_composer.cancel()
+
+
+def voice_for_token(token):
+    row = task_control.target(token)
+    return codex_composer if (token and token == codex_composer.token) or (row and row['agent'] == 'codex') else selected_voice
+
+
 import base64
 import ctypes
 import ctypes.util
@@ -590,13 +768,15 @@ _last_qian = 0.0         # fortune-reading debounce (impatient tapping)
 # wins. A board too old to send either never sets this (its voice starts carry
 # no `to`), so old firmware keeps the old behaviour exactly.
 _voice_to_front = False
+_voice_native = False      # latch the shortcut until the physical key releases
+_voice_board = False       # latch audio routing before queued start runs
 
 def log(*a):
     print(time.strftime("%H:%M:%S"), *a, flush=True)
 
 def load_overrides():
     global FOCUS_FOLLOW, STRETCH_AFTER_MIN, PICKUP_PAGE, VOICE_STYLE, VOICE_SOURCE, MIC_SINK_DEVICE, MIC_TAIL_S
-    global FOLLOW_FRONT, MIC_LINK, FOCUS_SETTLE_S, NOW_PLAYING, SHOW_OFF_SEATS
+    global FOLLOW_FRONT, MIC_LINK, FOCUS_SETTLE_S, NOW_PLAYING, SHOW_OFF_SEATS, VOICE_MODE
     global NO_BOARD_RESTART_S, RSS_RESTART_MB, LANG
     if CONFIG_OVERRIDE.exists():
         try:
@@ -631,6 +811,11 @@ def load_overrides():
                 MIC_LINK = "ble"
             STRETCH_AFTER_MIN = cfg.get("stretch_after_min", STRETCH_AFTER_MIN)
             PICKUP_PAGE = cfg.get("pickup_page", PICKUP_PAGE)
+            mode = cfg.get("voice_mode", VOICE_MODE)
+            if mode in ("hold_fn", "fn_double"):
+                VOICE_MODE = mode
+            else:
+                log("config: invalid voice_mode, keeping", VOICE_MODE)
             VOICE_STYLE = cfg.get("voice_style", VOICE_STYLE)
             VOICE_SOURCE = cfg.get("voice_source", VOICE_SOURCE)
             MIC_SINK_DEVICE = cfg.get("mic_sink_device", MIC_SINK_DEVICE)
@@ -1138,6 +1323,24 @@ def post_key(spec):
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
     log("key posted:", spec)
 
+def _emit_codex_native_key(keycode, down, control):
+    if not _HAVE_QUARTZ:
+        raise RuntimeError('Quartz unavailable for Codex native dictation')
+    with objc_pool():
+        event = Quartz.CGEventCreateKeyboardEvent(None, keycode, down)
+        if event is None:
+            raise RuntimeError('Cannot create native dictation keyboard event')
+        # Include the device-specific left Control bit (NX_DEVICELCTLKEYMASK)
+        # as well as the generic mask. Keep other modifiers out of this
+        # shortcut, matching the original explicit-flags behavior.
+        flags = (Quartz.kCGEventFlagMaskControl | 0x1) if control else 0
+        Quartz.CGEventSetFlags(event, flags)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+
+
+from native_dictation import NativeHold
+codex_native_hold = NativeHold(_emit_codex_native_key)
+
 # ------------------------------------------------------------------ watchers
 def scan_processes():
     try:
@@ -1230,7 +1433,16 @@ def codex_turn_is_main(p):
     if not tid:
         return True, "no thread id"          # older notify format: keep the old behaviour
     try:
-        if any(CODEX_SESSIONS.rglob(f"*{tid}.jsonl")):
+        for path in CODEX_SESSIONS.rglob(f"*{tid}.jsonl"):
+            with path.open('rb') as f:
+                for line in f.read(65536).splitlines():
+                    try: message=json.loads(line)
+                    except (ValueError, UnicodeError): continue
+                    if message.get('type') == 'session_meta':
+                        source=message.get('payload',{}).get('source','')
+                        if 'subagent' in str(source):
+                            return False, "subagent rollout"
+                        break
             return True, "rollout found"
     except OSError:
         return True, "sessions unreadable"
@@ -2202,7 +2414,7 @@ def _focus_ghostty(cwd, title):
     return ok and out == "ok"
 
 
-def focus_session(sid):
+def focus_session(sid, exact_only=False):
     """Bring session `sid`'s tab to the front. Returns the kind that worked:
     warp / terminal / iterm / ghostty = that exact tab, app = only the app,
     None = nothing to raise."""
@@ -2222,10 +2434,10 @@ def focus_session(sid):
             done = "iterm" if _focus_iterm(arg) else None
         elif kind == "ghostty":
             done = "ghostty" if _focus_ghostty(arg, rec.get("title") or "") else None
-        if not done and rec.get("bundle"):
+        if not done and not exact_only and rec.get("bundle"):
             subprocess.run(["open", "-b", rec["bundle"]], capture_output=True, timeout=3)
             done = "app"
-        elif not done and FOCUS_APPS.get("claude"):
+        elif not done and not exact_only and FOCUS_APPS.get("claude"):
             subprocess.run(["open", "-a", FOCUS_APPS["claude"]], capture_output=True, timeout=3)
             done = "app"
     except subprocess.TimeoutExpired:
@@ -2237,7 +2449,7 @@ def focus_session(sid):
     return done
 
 
-def focus_session_fast(sid):
+def focus_session_fast(sid, exact_only=False):
     """focus_session before dictation / the send Enter: always re-assert the
     tab, but pay the settle wait only when it was probably not in front (the
     voice key must not gain latency when nothing moves)."""
@@ -2245,7 +2457,7 @@ def focus_session_fast(sid):
         bundle = (claude_sessions.get(sid) or {}).get("bundle")
     name = (_bundle_names.get(bundle) or "").lower()
     known = _sess_front.get("sid") == sid and name and name in _frontmost_app().lower()
-    done = focus_session(sid)
+    done = focus_session(sid, exact_only=exact_only)
     time.sleep(0.1 if known else 0.35)
     return done
 
@@ -2978,13 +3190,65 @@ def handle_board_msg(raw, reply):
     if not isinstance(m, dict):          # "[1,2]" / "42" are valid JSON, not messages
         return
     t = m.get("t")
-    if t == "ping":
+    if t == 'dashboard_touch':
+        dashboard_last_touch.clear()
+        dashboard_last_touch.update(m)
+    elif t == "tasks_get":
+        reply(dashboard_encode(dashboard_service.store.page(
+            str(m.get("agent", "")), str(m.get("filter", "")),
+            m.get("cursor", ""), m.get("request_id", ""), time.time(), m.get("read_limit", 5))))
+    elif t == "task_select":
+        agent = str(m.get('agent', ''))
+        previous = task_control.target(str(m.get('target', ''))) if m.get('target') else None
+        handle = previous['handle'] if previous and previous['agent'] == agent else str(m.get('handle', ''))
+        result = task_control.select(agent, handle)
+        result['request_id'] = str(m.get('request_id', ''))[:24]
+        reply(dashboard_encode(result))
+        if result.get('token'):
+            token = result['token']
+            def open_selected():
+                cancel_selected_voice()
+                ok = task_control.run(token, selected_focus, lambda row: None)
+                reply(dashboard_encode(dict(t='task_status', v=1, agent=agent, token=token,
+                    error='' if ok else 'focus_unverified', phase='selected')))
+            inject(open_selected)
+    elif t == "task_cancel":
+        task_control.clear()
+        inject(cancel_selected_voice)
+    elif t == "voice" and 'target' in m:
+        token = str(m.get('target', ''))
+        agent = str(m.get('agent', ''))
+        def selected_dictation():
+            start = m.get('a') == 'start'
+            voice = voice_for_token(token)
+            voice_id = str(m.get('voice_id', ''))[:24]
+            if voice is codex_composer and not start and voice.voice_id != voice_id:
+                return  # a delayed release cannot stop a later utterance
+            ok = voice.start(token, VOICE_SOURCE == 'board' and bool(m.get('mic'))) if start else voice.stop(token)
+            if start and voice is codex_composer:voice.voice_id = voice_id
+            reply(dashboard_encode(dict(t='task_status', v=1, agent=agent, token=token,
+                error='' if ok else getattr(voice, 'error', 'focus_unverified') or 'task_changed', voice_id=voice_id, phase='voice_start' if start else 'voice_stop')))
+        inject(selected_dictation)
+    elif t == "key" and 'target' in m:
+        token = str(m.get('target', ''))
+        agent = str(m.get('agent', ''))
+        def selected_send():
+            voice = voice_for_token(token)
+            ok = m.get('k') == 'enter' and (voice.send(token, str(m.get('revision', ''))) if voice is codex_composer else voice.send(token))
+            reply(dashboard_encode(dict(t='task_status', v=1, agent=agent, token=token,
+                error='' if ok else getattr(voice, 'error', 'focus_unverified') or 'task_changed', voice_id=str(m.get('voice_id', ''))[:24], phase='send_requested' if voice is codex_composer else 'sent')))
+        inject(selected_send)
+    elif t == "ping":
         # the BOARD's own heartbeat, not our /test/rtt probe:
         # that one goes host -> board and comes back as {"t":"pong"}
         board_stat_update(m)
         reply(b'{"t":"pong"}\n')
     elif t == "hello":
+        task_control.clear()
+        inject(cancel_selected_voice)
         log("board hello:", m)
+        for agent in ("codex", "claude"):
+            reply(dashboard_encode(dashboard_service.store.summary(agent, time.time())))
         board_hello_at = time.time()
         _board_min_floor = None       # a rebooted board starts its own descent
         board_stat_update(m)
@@ -3038,7 +3302,7 @@ def handle_board_msg(raw, reply):
         threading.Thread(target=media_cmd, args=(m.get("cmd", ""),), daemon=True).start()
     elif t == "np_miss":                 # the board wants a cover that is not on the card
         threading.Thread(target=np_miss, args=(m.get("cover", ""),), daemon=True).start()
-    elif t in ("fack", "fls", "fcat", "frm", "ota", "spk", "pong", "plst"):   # answers to SD file / OTA / speak / rtt / player endpoints
+    elif t in ("fack", "fls", "fcat", "frm", "ota", "spk", "pong", "plst", "dashboard_state"):   # answers to SD file / OTA / speak / rtt / player endpoints
         _park_reply(m)
     elif t == "skins":            # who wears what, after a change on the card or from /test/skin
         if isinstance(m.get("skins"), dict):   # same key as on the hello
@@ -3096,10 +3360,14 @@ def handle_board_msg(raw, reply):
             to_front = m.get("to") == "front"
             global _voice_to_front
             _voice_to_front = to_front      # ... and so does the enter that follows
+            global _voice_native
+            native = agent == 'codex' and not to_front
+            _voice_native = native
+            dictation_key = codex_native_key if native else voice_key
+            global _voice_board
+            _voice_board = board_mic
             voice_sid = sess_for_action(m.get("sid")) if agent == "claude" and not to_front else None
             _mic_reset()
-            with _mic_lock:
-                _mic["session_board"] = board_mic
 
             def focus():
                 # asked inside the worker, at the moment fn goes down: the
@@ -3115,31 +3383,47 @@ def handle_board_msg(raw, reply):
                 # route A: sink up + BlackHole as default input BEFORE fn goes
                 # down; frames that arrived meanwhile are flushed once it is
                 def go():
-                    ok = mic_sink_begin()
-                    focus()
-                    voice_key(True)
-                    if ok:
-                        mic_sink_open_gate()
+                    with _mic_lock:
+                        _mic['session_board'] = True
+                    try:
+                        ok = codex_native_begin() if native else mic_sink_begin()
+                        if native and not ok:
+                            selected_end()
+                            log('codex native dictation: audio sink unavailable')
+                            return
+                        focus()
+                        dictation_key(True)
+                        if ok and not native:
+                            mic_sink_open_gate()
+                    except Exception:
+                        selected_end()
+                        raise
                     log("voice: board mic (%s) ->" % m.get("link", "?"), MIC_SINK_DEVICE if ok else "FAILED, Mac mic")
                 inject(go)
             else:
                 # the user may have clicked another window since focus follow ran
                 # (2026-09-01 gap): dictation must land in the agent's input box.
                 # Queued, not inline — see inject()
-                inject(lambda: (focus(), voice_key(True)))
+                def go_mac():
+                    with _mic_lock:
+                        _mic['session_board'] = False
+                    focus()
+                    dictation_key(True)
+                inject(go_mac)
         else:
-            with _mic_lock:
-                board_mic = _mic["session_board"]
-                _mic["session_board"] = False
+            dictation_key = codex_native_key if _voice_native else voice_key
+            board_mic = _voice_board
             if board_mic:
                 def stop():
-                    time.sleep(MIC_TAIL_S)       # let the tail of the audio reach the input method
-                    voice_key(False)
-                    time.sleep(0.5)              # input method finalizes on the current device
-                    mic_sink_end()
+                    if dictation_key is voice_key:
+                        time.sleep(MIC_TAIL_S)   # native key already waits for the tail
+                    try:
+                        dictation_key(False)
+                    finally:
+                        selected_end()
                 inject(stop)
             else:
-                inject(lambda: voice_key(False))
+                inject(lambda: dictation_key(False))
     elif t == "mic":
         if "d" in m:
             _mic_frame(m)
@@ -7018,6 +7302,9 @@ footer .sp{flex:1}
 
  <div class="page" data-page="host">
   <section><div class="grp">
+   <div class="row"><div class="lab"><span>Mac 性能监控</span><small>时钟页左右滑动可切换；网络统计 Wi-Fi / 有线接口</small></div><span class="val" id="perf_summary">等待数据</span></div>
+  </div></section>
+  <section><div class="grp">
    <div class="row"><div class="lab"><span data-t="host_t"></span><small data-th="host_sub"></small></div><button class="danger sm" onclick="restart()" data-t="restart_btn"></button></div>
    <div class="row" style="align-items:flex-start;padding-top:12px;padding-bottom:12px"><div class="lab"><span data-t="mem"></span><small id="memsub" data-t="mem_sub"></small></div>
     <div class="memw"><svg id="memsvg" viewBox="0 0 320 48" width="320" height="48" data-ta="mem_aria"><polyline id="memline" fill="none" stroke="#fff" stroke-width="1.5" stroke-linejoin="round" points=""/><line id="memzero" x1="0" x2="320" y1="47" y2="47" stroke="rgba(255,255,255,.12)"/></svg>
@@ -7451,7 +7738,8 @@ function save(){
   .catch(e=>toast(t('save_fail')+e))}
 document.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='s'){e.preventDefault();if(!$('#save').disabled)save()}});
 // One timer for the whole page: 状态 wants 2 s, everything else rides along.
-function tick(){fetch(API+'/settings/data').then(r=>r.json()).then(status).catch(()=>{})}
+function perfTick(){if((location.hash||'')!=='#host')return;fetch(API+'/host/performance').then(r=>r.json()).then(d=>{const p=document.getElementById('perf_summary');p.textContent=d.stale?'数据已过期':'CPU '+(d.cpu_pct==null?'--':Math.round(d.cpu_pct)+'%')+' · 内存 '+(d.memory_pct==null?'--':Math.round(d.memory_pct)+'%')}).catch(()=>{})}
+function tick(){perfTick();fetch(API+'/settings/data').then(r=>r.json()).then(status).catch(()=>{})}
 fetch(API+'/settings/data').then(r=>r.json()).then(d=>{fill(d);status(d)})
  .catch(e=>toast(t('no_host')+e));
 setInterval(tick,2000);
@@ -7647,7 +7935,12 @@ class HookHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/settings":
+        if self.path == "/host/performance":
+            self._ok(json.dumps(mac_performance_service.snapshot()).encode())
+        elif self.path == "/dashboard":
+            self._ok(json.dumps({a: dashboard_service.store.summary(a, time.time())
+                                for a in ("codex", "claude")}).encode())
+        elif self.path == "/settings":
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
@@ -7817,7 +8110,7 @@ class HookHandler(BaseHTTPRequestHandler):
             # /test/view/<play|clock|report|face|almanac|calendar>[?s=20] — force a page for s seconds
             q = dict(parse_qsl(self.path.split("?", 1)[1], keep_blank_values=True)) if "?" in self.path else {}
             p = self.path.split("?", 1)[0].rsplit("/", 1)[1]
-            if p not in ("np", "pod", "play", "clock", "face", "almanac", "calendar"):   # play = np alias; report retired 2026-09-09
+            if p not in ("np", "pod", "play", "clock", "perf", "face", "almanac", "calendar"):   # play = np alias; report retired 2026-09-09
                 self._ok(json.dumps({"ok": False, "why": "unknown page %r" % p}).encode())
                 return
             secs = int(np_num(q.get("s", 20), 20))
@@ -7863,6 +8156,31 @@ class HookHandler(BaseHTTPRequestHandler):
             for ident, frame in sys._current_frames().items():
                 out[names.get(ident, str(ident))] = traceback.format_stack(frame)[-6:]
             self._ok(json.dumps(out, ensure_ascii=False, indent=1).encode())
+        elif self.path == "/test/composer":
+            # Serialized, read-only diagnostics. No draft text or task identity.
+            done = threading.Event()
+            result = {}
+            def read_composer():
+                try:
+                    result.update(codex_composer.diagnostics())
+                finally:
+                    done.set()
+            inject(read_composer)
+            if not done.wait(3):
+                result = dict(error='timeout')
+            self._ok(json.dumps(result).encode())
+        elif self.path.startswith("/test/dashboard/"):
+            action = self.path.rsplit("/", 1)[1]
+            if action == 'touch':
+                self._ok(json.dumps(dashboard_last_touch).encode())
+            elif action == 'state':
+                rid = _new_rid()
+                push_board(dict(t='dashboard_test', action='state', id=rid))
+                self._ok(json.dumps(wait_reply('dashboard_state', rid, 3) or dict(error='timeout')).encode())
+            else:
+                if action in ("quota", "running", "unread", "back", "more", "scroll"):
+                    push_board({"t": "dashboard_test", "action": action})
+                self._ok()
         elif self.path.startswith("/test/select/"):
             # pretend the board swiped to <agent>: runs the real select path
             # (active seat, board lockout, debounced focus follow)
@@ -8236,6 +8554,10 @@ class HookHandler(BaseHTTPRequestHandler):
             payload = json.loads(raw or b"{}")
         except ValueError:
             payload = {}
+        if self.path == "/dashboard/quota/claude":
+            dashboard_service.accept_claude_quota(payload)
+            self._ok()
+            return
         if self.path == "/settings/save":
             self._ok(json.dumps(save_settings(payload), ensure_ascii=False).encode())
             return
@@ -8350,6 +8672,43 @@ def main():
     load_report()
     sess_load()                       # Claude sessions survive a host restart
     np_apply()                        # media-control listener
+    def dashboard_sessions():
+        now = time.time()
+        with lock:
+            return {sid: dict(row, state=sess_state(row, now))
+                    for sid, row in claude_sessions.items()}
+    dashboard_service.start(dashboard_sessions, push_raw)
+    mac_performance_service.start(push_raw)
+    def poll_composer_preview():
+        # Serialize with voice start/stop/send; do not queue a polling backlog.
+        done = threading.Event()
+        while True:
+            done.clear()
+            def poll():
+                try:
+                    message = codex_composer.poll()
+                    if message:push_raw(dashboard_encode(message))
+                finally:done.set()
+            inject(poll)
+            done.wait()
+            time.sleep(.5)
+    threading.Thread(target=poll_composer_preview, daemon=True).start()
+    def poll_conversation_detail():
+        from conversation_detail import selected_detail
+        previous, last_emit = None, 0
+        while True:
+            try:
+                message = selected_detail(task_control, dashboard_service.home)
+                wire = dashboard_encode(message) if message else None
+                # Repeat unchanged details to recover an initial selection/reply
+                # ordering race or a dropped delivery; board rendering is deduped.
+                if wire and (wire != previous or time.monotonic()-last_emit >= 6):
+                    push_raw(wire); last_emit = time.monotonic()
+                previous = wire
+            except Exception:
+                previous = None
+            time.sleep(3)
+    threading.Thread(target=poll_conversation_detail, name='task-detail', daemon=True).start()
     threading.Thread(target=watcher_loop, daemon=True).start()
     threading.Thread(target=ble_thread, daemon=True).start()
     threading.Thread(target=power_thread, daemon=True).start()   # links down before a Mac sleep

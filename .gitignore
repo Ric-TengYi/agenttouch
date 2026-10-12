@@ -1,6 +1,7 @@
 firmware/.pio/
 __pycache__/
 *.pyc
+.worktrees/
 .DS_Store
 # your own values, never committed (see README「本地覆盖」)
 firmware/src/config.local.h

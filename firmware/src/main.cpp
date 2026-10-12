@@ -20,6 +20,11 @@
 #include "pins.h"
 #include "config.h"
 #include "face.h"
+#include "dashboard.h"
+#include "dashboard_gesture.h"
+#include "battery_badge.h"
+#include "clock_cards.h"
+#include "mac_performance.h"
 #include "pages.h"
 #include "audio.h"
 #include "ble.h"
@@ -131,6 +136,7 @@ static uint32_t lastTapAt = 0;
 static uint32_t setCardUntil = 0;
 static const uint8_t BRIGHT_LVLS[3] = BRIGHT_LEVELS;
 static uint8_t brightLvl = 1;
+static int liveBatteryPct = -1;
 static uint8_t powState = 0;   // 0 = on battery, 1 = charging, 2 = USB + full
 // "拿起时显示" binding (doc/06 screen-sovereignty rules): what the pet shows
 // while confirmed in-hand. Host pushes {"t":"cfg","pickup":"face"} from
@@ -226,7 +232,7 @@ static bool almanacView = true;   // almanac is this orientation's HOME page
                                   // shows the calendar, right-swipe returns
 // Clock orientation is a three-page strip with the clock in the middle:
 // 播客 ←右滑← 钟表 →左滑→ 当前播放, no wrap-around.
-enum ClockView : uint8_t { CV_POD = 0, CV_CLOCK, CV_NP };   // 播客 ←右滑← 钟表 →左滑→ 当前播放
+// Card order: podcast, clock, Mac performance, now playing.
 static uint8_t clockView = CV_CLOCK;
 // Which source the play page is showing, and the double-tap override that
 // beats the automatic answer until that answer itself changes.
@@ -249,6 +255,7 @@ static uint32_t sendUntil = 0;
 // it must land where the words did, even though the bubble is tapped later
 // (on the face page) and the seat may have moved meanwhile.
 static bool voiceToFront = false;
+static String voiceTarget;
 static char voiceSid[9] = "";          // the session that utterance went to
 static uint32_t demoStart       = 0;   // != 0 while the 8-face demo runs
 static int8_t   demoFace        = -1;  // -1 = full tour, else one fixed face
@@ -676,6 +683,13 @@ static void pageXY(int x, int y, int& px, int& py) {
     case 3:  px = y;       py = x;       break;   // observed on device 2026-09-09 morning (user-validated zones)
     default: px = x;       py = y;       break;
   }
+}
+
+// Dashboard uses the canvas coordinate frame; legacy pageXY reflects x
+// at quarter turns. Physical Return at native (415,354), shownRot=1,
+// must map to (125,415), rather than the Refresh region (354,415).
+static void dashboardXY(int x, int y, int& px, int& py) {
+  dashboardPoint(x,y,(4-shownRot)&3,px,py);
 }
 
 // ---- microphone streaming (mic-blackhole branch) ----
@@ -1576,6 +1590,23 @@ static void handleLine(const String& line) {
   }
   if (visitor) return;       // not the owner's link: only hostinfo/claim get through
   lastRx = millis();
+  if (strcmp(t, "dashboard_test") == 0) {
+    if (sessEffState()!=ST_NEEDS_YOU && !listening && !claimShowing()) {
+      const char* action=d["action"]|"";
+      if(strcmp(action,"state")==0) { JsonDocument response; dashboardInspect(response); response["id"]=d["id"]; sendJson(response); return; }
+      if(strcmp(action,"scroll")==0) { dashboardScroll(1); return; }
+      int x=strcmp(action,"quota")==0?108:strcmp(action,"back")==0?156:strcmp(action,"unread")==0?330:230;
+      int y=strcmp(action,"more")==0?382:strcmp(action,"quota")==0?107:strcmp(action,"back")==0?424:strcmp(action,"running")==0?101:130;
+      JsonDocument request;
+      if(dashboardTap(x,y,selected,request) && !request.isNull()) sendJson(request);
+    }
+    return;
+  }
+  if (strcmp(t, "dashboard") == 0 || strcmp(t, "tasks") == 0 || strcmp(t,"task_selected")==0 || strcmp(t,"task_status")==0 || strcmp(t,"task_detail")==0) {
+    dashboardHandle(d, agentIdxById(d["agent"] | ""), millis());
+    return;
+  }
+  if (strcmp(t,"mac_perf")==0) { macPerformanceHandle(d,millis()); return; }
   if (strcmp(t, "state") == 0) {
     uint8_t prev[N_AGENTS];
     memcpy(prev, agentStates, sizeof(prev));
@@ -1695,13 +1726,14 @@ static void handleLine(const String& line) {
     r["pos"] = pos; r["dur"] = dur; r["play"] = playing ? 1 : 0;
     r["n"] = playerCount(); r["i"] = playerInfo().index;
     r["src"] = src == PSRC_MAC ? "mac" : "sd";
-    r["page"] = clockView == CV_NP ? "np" : clockView == CV_POD ? "pod" : "clock";
+    r["page"] = clockView == CV_PERF ? "perf" : clockView == CV_NP ? "np" : clockView == CV_POD ? "pod" : "clock";
     sendJson(r);
   } else if (strcmp(t, "view") == 0) {      // host debug (/test/view/<p>): force a page for s seconds
     const char* pv = d["p"] | "";
     int sec = d["s"] | 20;
     uint8_t pg = 255, sub = 0;
     if      (!strcmp(pv, "face"))     { pg = PAGE_FACE; }
+    else if (!strcmp(pv, "perf")) { pg = PAGE_CLOCK; sub = CV_PERF; }
     else if (!strcmp(pv, "clock"))    { pg = PAGE_CLOCK;    sub = CV_CLOCK; }
     else if (!strcmp(pv, "np") || !strcmp(pv, "play")) { pg = PAGE_CLOCK; sub = CV_NP; }
     else if (!strcmp(pv, "pod"))      { pg = PAGE_CLOCK;    sub = CV_POD; }
@@ -2605,6 +2637,10 @@ static void IRAM_ATTR onTpIrq() { tpIrq = true; }
 
 static int tpStartX = 0, tpStartY = 0;   // press-down point
 static int tpLastX  = 0, tpLastY  = 0;   // latest point while held
+static TouchReportState touchReport;
+static uint32_t touchGestureReports=0;
+static DashboardGesture dashboardGesture;
+static bool dashboardGestureActive=false;
 static uint32_t tpDownAt = 0;            // press-down time (long-press actions)
 static bool tpConsumed = false;          // hold already acted; release is a no-op
 static int8_t  petDir     = 0;           // dominant-axis stroke dir while held (±1 x, ±2 y)
@@ -2647,7 +2683,7 @@ static bool pinHit(int x, int y) {
   return vx >= LCD_W - PIN_HIT && vy >= LCD_H - PIN_HIT;
 }
 
-// Claude 多会话 top band: y < 110 of the face's view frame, cut
+// Claude 多会话 top band: y < 76 of the face's view frame, cut
 // at x 240 — -1 = left half (previous), +1 = right half (next), 0 = not a
 // session tap. Live only while the row is on screen and the seat on screen
 // owns ≥2 sessions; a hidden row leaves the top as a plain tap (nudge).
@@ -2658,7 +2694,7 @@ static int sessTopHalf(int x, int y) {
   if (!sessActive() || !faceSessRowShown()) return 0;
   int vx, vy;
   pageXY(x, y, vx, vy);
-  if (vy >= 110) return 0;
+  if (vy >= 76) return 0;
   return vx < 240 ? -1 : 1;
 }
 
@@ -2666,12 +2702,19 @@ static void touchPoll() {
   if (!tpOk) return;
   if ((pendH || pendV) && (int32_t)(millis() - pendAt) > 300) execPendingSwipe();
   if (!tpIrq && !tpWasDown) return;
-  tpIrq = false;
-  int16_t rx = 0, ry = 0;
-  uint8_t n = tp.getPoint(&rx, &ry, 1);
-  bool down = n > 0;
-  if (down) {
-    int x = rx, y = ry;
+  // ACK consumes one event packet. Polling again without a fresh IRQ can
+  // return zero even while the finger stays down; that is not a release.
+  noInterrupts();
+  bool freshReport=tpIrq;
+  tpIrq=false;
+  interrupts();
+  int x=tpLastX, y=tpLastY;
+  bool pressed=false;
+  if(freshReport) {
+    int16_t rx=0,ry=0;
+    pressed=tp.getPoint(&rx,&ry,1)>0;
+    if(pressed) {
+      x=rx; y=ry;
 #if TOUCH_SWAP_XY
     int tmp = x; x = y; y = tmp;
 #endif
@@ -2681,15 +2724,26 @@ static void touchPoll() {
 #if TOUCH_MIRROR_Y
     y = LCD_H - 1 - y;
 #endif
+    }
+    ++touchGestureReports;
+  }
+  bool down=touchReport.update(freshReport,pressed);
+  dashboardTouchHeld(down);
+  if(down) {
     if (!tpWasDown) {
+      touchGestureReports=1;
       tpStartX = x; tpStartY = y;
       tpDownAt = millis();
       tpConsumed = false;
+      int gx,gy; dashboardXY(x,y,gx,gy);
+      dashboardGesture.begin(gx,gy);
+      dashboardGestureActive=dashboardOpen() && shownPage==PAGE_FACE && gy>=90 && gy<390 &&
+        !listening && !claimShowing() && sessEffState()!=ST_NEEDS_YOU;
       noteActivity();
     }
     // petting = back-and-forth rubbing, either axis, lifts allowed: the
     // finger reversing direction is what a deliberate swipe never does
-    if (tpWasDown && shownPage == PAGE_FACE && !pickedUp) {
+    if (tpWasDown && shownPage == PAGE_FACE && !pickedUp && !dashboardOpen()) {
       int sx = x - tpLastX, sy = y - tpLastY;
       int8_t dir = 0;
       if      (abs(sx) > 5 && abs(sx) >= abs(sy)) dir = sx > 0 ? 1 : -1;
@@ -2716,13 +2770,19 @@ static void touchPoll() {
         petDir = dir;
       }
     }
+    if(dashboardGestureActive && dashboardOpen() && !listening && !claimShowing() && sessEffState()!=ST_NEEDS_YOU) {
+      int gx,gy; dashboardXY(x,y,gx,gy);
+      int steps=dashboardGesture.move(gx,gy);
+      if(steps) dashboardScroll(steps);
+      if(dashboardGesture.consumed || (int32_t)(millis()-tpDownAt)>=600) tpConsumed=true;
+    }
     tpLastX = x; tpLastY = y;
 
     // hold ~1.5 s on the face = settings card. The approve bubble keeps its
     // own long-press (reject), so the hold is inert while needs_you is up
     // (the bubble's own rule: the current session's state).
     if (tpWasDown && !tpConsumed && !pendH && !pendV && !demoStart &&
-        shownPage == PAGE_FACE && !listening &&
+        shownPage == PAGE_FACE && !listening && !dashboardOpen() &&
         sessEffState() != ST_NEEDS_YOU &&
         (int32_t)(petUntil - millis()) <= 0 &&
         (int32_t)(setCardUntil - millis()) <= 0 && !claimShowing() &&
@@ -2758,6 +2818,18 @@ static void touchPoll() {
     }
     bool vh = abs(vdx) > SWIPE_MIN_PX && abs(vdx) > 2 * abs(vdy);
     bool vv = abs(vdy) > VSWIPE_MIN_PX && 2 * abs(vdy) > 3 * abs(vdx);
+    if(dashboardOpen()) {
+      int tx,ty; dashboardXY(tpLastX,tpLastY,tx,ty);
+      JsonDocument diag; dashboardInspect(diag);
+      diag["t"]="dashboard_touch"; diag["x"]=tx; diag["y"]=ty; diag["rot"]=shownRot;
+      diag["native_x"]=tpLastX; diag["native_y"]=tpLastY; diag["consumed"]=tpConsumed;
+      diag["vh"]=vh; diag["vv"]=vv; diag["listening"]=listening; diag["shown_page"]=shownPage;
+      int startViewX,startViewY; dashboardXY(tpStartX,tpStartY,startViewX,startViewY);
+      diag["view_dx"]=tx-startViewX; diag["view_dy"]=ty-startViewY;
+      diag["drag"]=dashboardGesture.dragging;
+      diag["held_ms"]=(uint32_t)(millis()-tpDownAt); diag["reports"]=touchGestureReports;
+      sendJson(diag);
+    }
     if (claimShowing()) {
       // claim card owns the touch (modal). Only the green button says yes;
       // outside the card or a >=700 ms hold says no; swipes and the rest of
@@ -2780,6 +2852,13 @@ static void touchPoll() {
         if (hold || hit < 0) claimResolve(false, "declined");
         else if (hit == 1)   claimResolve(true, "tap");
       }
+    } else if (dashboardGestureActive && dashboardOpen() && shownPage==PAGE_FACE &&
+               !listening && sessEffState()!=ST_NEEDS_YOU && [&]() {
+                 int gx,gy; dashboardXY(tpLastX,tpLastY,gx,gy); return dashboardGesture.back(gx,gy);
+               }()) {
+      JsonDocument request;
+      if(dashboardBack(selected,request) && !request.isNull()) { sendJson(request); sendUntil=0; }
+      tpConsumed=false; pendH=pendV=0;
     } else if (tpConsumed) {
       tpConsumed = false;    // the hold already opened the settings card
     } else if (shownPage == PAGE_FACE &&
@@ -2806,7 +2885,17 @@ static void touchPoll() {
         }
       }
     } else if (shownPage == PAGE_FACE) {
-      if (wasPetting) {
+      if (dashboardOpen() && !listening && sessEffState()!=ST_NEEDS_YOU) {
+        int sx,sy,ex,ey;
+        dashboardXY(tpStartX,tpStartY,sx,sy); dashboardXY(tpLastX,tpLastY,ex,ey);
+        int ddx=ex-sx, ddy=ey-sy;
+        if(abs(ddy)>=24 && 5*abs(ddy)>=6*abs(ddx)) dashboardScroll(ddy<0?1:-1);
+        else if (!vh && !hswipe && !vswipe) {
+          int tx,ty; dashboardXY(tpLastX,tpLastY,tx,ty); JsonDocument request;
+          dashboardTap(tx,ty,selected,request);
+          if(!request.isNull()) { sendJson(request); sendUntil=0; }
+        }
+      } else if (wasPetting) {
         // lifting off after a petting session: no swipe/tap side effects
       } else if (vh) {
         // swipe left = next seat to the right (executes deferred, see above).
@@ -2834,14 +2923,22 @@ static void touchPoll() {
         bool rejectHold = effNeeds && (int32_t)(nowMs - tpDownAt) >= 700;
         bool pin = pinHit(tpLastX, tpLastY);
         int half = (pin || rejectHold) ? 0 : sessTopHalf(tpLastX, tpLastY);
-        if (pin) {
+        int dx, dy; pageXY(tpLastX, tpLastY, dx, dy);
+        JsonDocument dashboardRequest;
+        bool dashboardHit = !effNeeds && !pin && !listening &&
+          (int32_t)(setCardUntil-nowMs)<=0 && (int32_t)(profUntil-nowMs)<=0 &&
+          (int32_t)(sendUntil-nowMs)<=0 && !claimShowing() &&
+          dashboardTap(dx,dy,selected,dashboardRequest);
+        if (dashboardHit) {
+          if (!dashboardRequest.isNull()) sendJson(dashboardRequest);
+        } else if (pin) {
           // corner pin wins the tap before every other face action (doc/06):
           // status toast, double-tap profile and the approve bubble all live
           // in the middle, so the corner is unambiguously about pinning.
           setPinned(!pinned, PAGE_FACE);
         } else if (half) {
           // Claude 多会话: the session row is showing, so the top
-          // band (y < 110) steps the list — left half back, right half on.
+          // band (y < 76) steps the list — left half back, right half on.
           // Not a "tap" for the double-tap clock: two quick taps here are two
           // steps, and a tap on the face right after must not open the card.
           sessStep(half);
@@ -2849,7 +2946,8 @@ static void touchPoll() {
           sendUntil = 0;
           JsonDocument kd;      // same destination the words went to
           kd["t"] = "key"; kd["k"] = "enter";
-          if (voiceToFront) kd["to"] = "front";
+          if (voiceTarget.length()) { kd["target"]=voiceTarget; kd["agent"]=AGENTS[selected].id; }
+          else if (voiceToFront) kd["to"] = "front";
           else if (voiceSid[0]) kd["sid"] = voiceSid;   // the session it was said to
           sendJson(kd);
           audioPlay(SND_DONE);
@@ -2899,7 +2997,7 @@ static void touchPoll() {
       } else {
         audioPlay(SND_TICK);                         // nothing to cycle yet (old host / old card file)
       }
-    } else if (shownPage == PAGE_CLOCK && clockView != CV_CLOCK && vv) {
+    } else if (shownPage == PAGE_CLOCK && (clockView == CV_NP || clockView == CV_POD) && vv) {
       // 播放页 up/down = volume ±10, like the face page; the toast is the
       // bar along the bottom band. Immediate: the petting deferral is a
       // face-page problem only. Sign: the shared table's vdy row for canvas
@@ -2913,7 +3011,7 @@ static void touchPoll() {
       audioSetVolume(audioVolume() + (up ? 10 : -10));
       volShowUntil = millis() + 1500;
       audioPlay(SND_TICK);
-    } else if (shownPage == PAGE_CLOCK && clockView != CV_CLOCK &&
+    } else if (shownPage == PAGE_CLOCK && (clockView == CV_NP || clockView == CV_POD) &&
                !vh && !hswipe && !vswipe) {
       // compact card: the transport band is three 160×160
       // zones — prev|toggle|next on 当前播放, -15 s|toggle|+15 s on 播客 —
@@ -2953,14 +3051,9 @@ static void touchPoll() {
           audioPlay(almanacView != langEn() ? SND_TICK : SND_SELECT);   // home = tick, away = select
         }
       } else {
-        // 三联页 (user 2026-09-09): 播客 ←右滑← 钟表 →左滑→ 当前播放,
-        // no wrap — the two players never reach each other directly.
-        if (vdx > SWIPE_MIN_PX) {
-          if (clockView == CV_CLOCK)   { clockView = CV_POD;   audioPlay(SND_SELECT); }
-          else if (clockView == CV_NP) { clockView = CV_CLOCK; audioPlay(SND_TICK); }
-        } else if (vdx < -SWIPE_MIN_PX) {
-          if (clockView == CV_POD)        { clockView = CV_CLOCK; audioPlay(SND_TICK); }
-          else if (clockView == CV_CLOCK) { clockView = CV_NP;    audioPlay(SND_SELECT); }
+        if(vdx > SWIPE_MIN_PX || vdx < -SWIPE_MIN_PX) {
+          uint8_t next=clockCardStep(clockView,vdx<0?1:-1);
+          if(next!=clockView) { clockView=next;audioPlay(next==CV_CLOCK?SND_TICK:SND_SELECT); }
         }
       }
     }
@@ -3175,6 +3268,7 @@ void loop() {
 
   pmuKeyScan(bPwr); btnScan(bIo18); btnScan(bBoot);   // middle key lives on the PMU
   if (bPwr.pressed || bIo18.pressed || bBoot.pressed) noteActivity();
+  { JsonDocument request; if(dashboardPoll(request)) sendJson(request); }
   tcpPump();                           // finish any parked TCP remainder before new writers
   micDrain();
   bleTestPoll();
@@ -3188,21 +3282,24 @@ void loop() {
   // (10 s at most) hard-cuts the rail no matter what REG 22H[1] says — it is
   // EFUSE-locked on this part (measured: rst=poweron at ~10 s with the bit
   // cleared). A dictation key that kills the board mid-sentence is no key.
-  if (bIo18.pressed) {
+  if (bIo18.pressed && (!dashboardOpen() || dashboardVoiceToken().length())) {
     listening = true;
+    dashboardVoiceBegin();
     sendUntil = 0;                     // new dictation: retire the old bubble
     audioPlay(SND_VOICE_ON);
     JsonDocument d;
     d["t"] = "voice"; d["a"] = "start"; d["agent"] = AGENTS[selected].id;
     // shownPage is what is REALLY on screen this frame, so a face carried in
     // the hand (or grabbed by needs_you) still talks to its own seat.
-    voiceToFront = shownPage != PAGE_FACE;
+    voiceTarget = dashboardVoiceToken();
+    voiceToFront = !voiceTarget.length() && shownPage != PAGE_FACE;
+    if (voiceTarget.length()) { d["target"] = voiceTarget; d["voice_id"] = dashboardVoiceId(); }
     if (voiceToFront) d["to"] = "front";
     // face-page dictation goes to the session on screen; latched like
     // voiceToFront so the send bubble's Return lands in the same tab even if
     // the row moves on before the tap. Desk pages stay "front" only.
     voiceSid[0] = 0;
-    if (!voiceToFront && sessActive()) {
+    if (!voiceToFront && !voiceTarget.length() && sessActive()) {
       strlcpy(voiceSid, sessList[sessCur].id, sizeof(voiceSid));
       d["sid"] = voiceSid;
     }
@@ -3211,12 +3308,14 @@ void loop() {
     d["link"] = micLink == MICLINK_BLE ? "ble" : micLink == MICLINK_TCP ? "tcp" : "none";
     sendJson(d);
   }
-  if (bIo18.released) {
+  if (bIo18.released && listening) {
     listening = false;
-    sendUntil = now + 6000;            // arms the tap-to-send bubble
+    dashboardVoiceEnd();
+    sendUntil = voiceTarget.length()?0:now + 6000; // selected draft uses preview confirmation
     audioPlay(SND_VOICE_OFF);
     JsonDocument d;
     d["t"] = "voice"; d["a"] = "stop"; d["agent"] = AGENTS[selected].id;
+    if(voiceTarget.length()) { d["target"] = voiceTarget; d["voice_id"] = dashboardVoiceId(); }
     sendJson(d);
     if (micOnTalk) audioMicStop();
   }
@@ -3374,7 +3473,8 @@ void loop() {
       wasChg = chg; wasFull = full;
       powState = chg ? 1 : (vbus ? 2 : 0);
 
-      int pct = pmu.isBatteryConnect() ? pmu.getBatteryPercent() : -1;
+      int pct = batteryPercent(pmu.isBatteryConnect() ? pmu.getBatteryPercent() : -1);
+      liveBatteryPct = pct;
       if (!vbus && pct >= 0 && pct <= 5) {
         if (!lowSince) lowSince = now;     // 60 s of confirmed low, so one
       } else lowSince = 0;                 // noisy PMU reading can't kill us
@@ -3498,6 +3598,8 @@ void loop() {
     // asleep face-down: paint one black frame, then let the panel rest
     static bool sleepBlanked = false;
     if (flipped) {
+      dashboardInvalidateFrame();
+      macPerformanceInvalidate();
       if (!sleepBlanked) {
         canvas->fillScreen(0);
         canvas->flush();
@@ -3588,10 +3690,18 @@ void loop() {
     int32_t pleft = (int32_t)(toastUntil - now);
     float pinK = pleft <= 0 ? 0.0f : (pleft < 400 ? pleft / 400.0f : 1.0f);
     const char* pinLabel = toastText;
+    bool perfShown=pg==PAGE_CLOCK && (viewLock?viewSub:bound?CV_CLOCK:clockView)==CV_PERF;
+    if(!perfShown)macPerformanceInvalidate();
     if (pg != PAGE_FACE) {
+      dashboardInvalidateFrame();
       canvas->setRotation((4 - rotSec) & 3);
       uint8_t cv = viewLock ? viewSub : bound ? CV_CLOCK : clockView;
       bool wantAlm = viewLock ? viewSub != 0 : (bound ? true : almanacView);
+      if (pg == PAGE_CLOCK && cv==CV_PERF) {
+        macPerformanceRender(canvas,gfx,now,(4-rotSec)&3,battFakeOn()?battFakePct:liveBatteryPct,
+          powState==1,pinned,(int32_t)(pinLitUntil-now)>0,AGENTS[selected].color,pinLabel,pinK);
+        delay(2);return;
+      }
       if (pg == PAGE_CLOCK) {
         // clock is home for this orientation; 播客 (right) and 当前播放 (left)
         // are its two flip sides, one renderer with the page's own source
@@ -3612,12 +3722,11 @@ void loop() {
       // the same corner pin the face wears: seat color for 10 s, then grey
       if (pinned) drawPagePin(canvas, (int32_t)(pinLitUntil - now) > 0, AGENTS[selected].color);
       // low battery: the face's corner icon, bottom-left here (pages.cpp)
-      drawPageBatt(canvas, battFakeOn() ? battFakePct
-                           : (pmuOk && pmu.isBatteryConnect()) ? pmu.getBatteryPercent()
-                           : -1, now);
+      drawPageBatt(canvas, battFakeOn() ? battFakePct : liveBatteryPct, now);
       int toastCy = pg == PAGE_CALENDAR ? (wantAlm && almanacValid() ? 286 : 368)
                   : (cv == CV_CLOCK ? (langEn() ? 296 : 300) : 368);   // en panel top is 320
       drawPillToast(canvas, pinLabel, pinK, toastCy);
+      drawBatteryBadge(canvas,battFakeOn()?battFakePct:liveBatteryPct,powState==1);
       canvas->setRotation(0);
       canvas->flush();
       delay(2);
@@ -3659,9 +3768,7 @@ void loop() {
     f.showOff = showOffSeats;
     f.wifiUp = WiFi.status() == WL_CONNECTED;
     f.hostUp = hostUp || bleConnected();
-    f.battPct = -1;
-    if (battFakeOn()) f.battPct = battFakePct;
-    else if (pmuOk && pmu.isBatteryConnect()) f.battPct = pmu.getBatteryPercent();
+    f.battPct = battFakeOn()?batteryPercent(battFakePct):liveBatteryPct;
     f.volume = audioVolume();
     // 眼神追声: eyes drift toward the last confident sound for
     // ~1.5 s, then ease back. Board axis (+ = MIC1, the right edge keys-up)
@@ -3788,9 +3895,12 @@ void loop() {
     // so this is a no-op there.
     canvas->setRotation((4 - rotSec) & 3);
     f.hideBubble = toastOnBubble && pinK > 0.0f;
+    bool dashboardBlocked = f.st == ST_NEEDS_YOU || (f.listening && !dashboardDetail()) || f.offline || f.setK > 0.03f || f.profK > 0.03f || f.claimK > 0.03f || (f.sendK > 0.03f && !dashboardDetail());
+    if(dashboardRenderPage(canvas,gfx,selected,dashboardBlocked,now,(4-rotSec)&3,f.battPct,powState==1)) { delay(2); return; }
     faceRender(canvas, f, now);
     // the 名牌 rides on top of any page; mac_approve sits where the bubble was
     drawPillToast(canvas, pinLabel, pinK, f.hideBubble ? 341 : 368);
+    drawBatteryBadge(canvas,f.battPct,powState==1);
     canvas->setRotation(0);
     canvas->flush();
   }

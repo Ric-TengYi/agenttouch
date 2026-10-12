@@ -7,6 +7,7 @@
 // dots, "?", sweat) are accents only.
 // Spec: design/EFaces.dc.html (states) + design/EWorkMotion.dc.html (timing).
 #include "face.h"
+#include "dashboard.h"
 #include "grokface.h"   // 第六套皮肤 grok: polygon eyes + shared blink clock
 #include "pages.h"   // almanacPrint: shared AA CJK text (send bubble)
 #include "i18n.h"
@@ -1125,9 +1126,10 @@ void faceRender(Arduino_Canvas* c, const FaceFrame& f, uint32_t t) {
   s_srK = rowUp ? toastK : 0.0f;
   s_srAt = millis();
 
+  dashboardDraw(c, f.agentIdx, f.st == ST_NEEDS_YOU || (f.listening && !dashboardDetail()) || f.offline || f.setK > 0.03f || f.profK > 0.03f || f.claimK > 0.03f || (f.sendK > 0.03f && !dashboardDetail()), t);
   if (f.pinVis) drawPin(c, f);
   if (f.volK > 0.03f) drawVolume(c, f);
-  if (f.sendK > 0.03f) drawSendBubble(c, f);
+  if (f.sendK > 0.03f && !dashboardDetail()) drawSendBubble(c, f);
   if (f.profK > 0.03f) drawProfile(c, f);
   if (f.setK > 0.03f) drawSettingsCard(c, f);
   if (f.claimK > 0.03f) drawClaimCard(c, f, t);   // last: it is modal
