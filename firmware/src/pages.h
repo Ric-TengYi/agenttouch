@@ -84,3 +84,5 @@ void almanacCommit();
 int  almanacAltCount();
 int  almanacPick();                 // 0 = own draw, 1..n = alternates
 int  almanacPickStep(int dir);      // +1 / -1, wraps; returns the new pick
+
+void drawBatteryBadge(Arduino_Canvas* c,int percent,bool charging);

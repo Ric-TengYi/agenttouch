@@ -35,7 +35,8 @@ class TaskControl:
             result = dict(t='task_selected', v=1, agent=agent, token='', error='')
             if not snap['identity'] or now - snap['observed_at'] > 30:
                 return dict(result, error='source_unavailable')
-            row = next((r for r in snap['tasks'] if r['handle'] == handle), None)
+            row = next((r for r in snap['tasks'] if r['handle'] == handle or
+                        r.get('stable_handle') == handle), None)
             if not row:
                 return dict(result, error='task_changed')
             token = secrets.token_hex(16)

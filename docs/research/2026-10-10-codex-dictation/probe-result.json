@@ -1,0 +1,8 @@
+{
+  "synthetic_audio_only": true,
+  "sent_to_conversation": false,
+  "http_status": 403,
+  "content_type": "text/html; charset=UTF-8",
+  "error_code": "non_json_response",
+  "elapsed_s": 0.57
+}

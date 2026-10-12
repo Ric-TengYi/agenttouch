@@ -17,6 +17,20 @@ def snapshot(now=1000):
     return snap
 
 class TaskControlTests(unittest.TestCase):
+    def test_visible_stable_handle_survives_background_refresh(self):
+        control=TaskControl(self.store,clock=lambda:1001)
+        row=self.store.get('codex',1000)['tasks'][1]
+        handle=row['stable_handle']
+        new=snapshot();new['tasks'][1]['unread']=False;new['tasks'].reverse()
+        self.store.update('codex',new,1001)
+        chosen=control.select('codex',handle)
+        self.assertEqual(control.target(chosen['token'])['thread_id'],row['thread_id'])
+        new['identity']='other-account';self.store.update('codex',new,1001)
+        self.assertEqual(control.select('codex',handle)['error'],'task_changed')
+        new=snapshot();new['tasks']=[r for r in new['tasks'] if r['thread_id']!=row['thread_id']]
+        self.store.update('codex',new,1001)
+        self.assertEqual(control.select('codex',handle)['error'],'task_changed')
+
     def setUp(self):
         self.store=D.DashboardStore();self.store.update('codex',snapshot(),1000)
 

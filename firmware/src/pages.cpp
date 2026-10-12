@@ -5,6 +5,7 @@
 // agent-accent details, one white rounded card with a flat analog dial.
 // Time comes from the host ({"t":"time"}); a soft clock runs on millis().
 #include "pages.h"
+#include "battery_badge.h"
 #include "config.h"
 #include "pet_fonts.h"
 #include "i18n.h"
@@ -940,7 +941,8 @@ void drawPlayPage(Arduino_Canvas* c, uint32_t t, uint16_t accent, uint8_t src,
     pmText(1, AF_TINY, sub, TEXT_W, false);
     int lines = pmLines[0];
     int blockH = lines * 33 + (sub[0] ? 4 + 24 : 0);
-    int top = ART_Y + (ART_S - blockH) / 2;
+    // Reserve the status badge above the title block.
+    int top = max(BATTERY_TOP + BATTERY_HEIGHT, ART_Y + (ART_S - blockH) / 2);
     afPrint(c, AF_BODY, TEXT_X, top + 26, pmL1[0], AL_WHITE, AL_INK);
     if (lines == 2) afPrint(c, AF_BODY, TEXT_X, top + 26 + 33, pmL2[0], AL_WHITE, AL_INK);
     if (sub[0]) afPrint(c, AF_TINY, TEXT_X, top + lines * 33 + 4 + 18, pmL1[1], AL_GREY, AL_INK);
@@ -1033,4 +1035,21 @@ int playZoneAt(int px, int py) {
   if (px < 160) return -1;
   if (px >= 320) return +1;
   return 0;
+}
+
+// Battery status aligned to the physical round panel edge.
+void drawBatteryBadge(Arduino_Canvas* c,int percent,bool charging) {
+  percent=batteryPercent(percent);
+  uint16_t color=charging?0x07e0:percent>=0 && percent<10?0xf800:percent>=0 && percent<20?0xfd20:0xffff;
+  c->fillRect(BATTERY_LEFT,BATTERY_TOP,BATTERY_WIDTH,BATTERY_HEIGHT,0);
+  const int x=BATTERY_LEFT, y=BATTERY_TOP;
+  c->drawRoundRect(x+2,y+5,17,11,2,color);
+  c->fillRect(x+19,y+9,2,4,color);
+  if(percent>0) c->fillRect(x+4,y+7,max(1,13*percent/100),7,color);
+  if(charging) { c->drawLine(x+7,y+7,x+7,y+13,0); c->drawLine(x+4,y+10,x+10,y+10,0); }
+  char value[8];
+  if(percent<0) snprintf(value,sizeof(value),"--");
+  else snprintf(value,sizeof(value),"%d%%",percent);
+  c->setFont((const GFXfont*)nullptr); c->setTextSize(2); c->setTextColor(color);
+  c->setCursor(x+BATTERY_WIDTH+2-strlen(value)*12,y+2); c->print(value); c->setTextSize(1);
 }

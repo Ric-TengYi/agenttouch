@@ -40,3 +40,18 @@ class ServiceTests(unittest.TestCase):
             db.commit();db.close()
             self.assertNotIn('a',[r['thread_id'] for r in D.read_codex(fixture.home,1000)['tasks']])
         finally: fixture.tearDown()
+
+class QuotaSourceTests(unittest.TestCase):
+    def test_native_seven_day_window_and_identity(self):
+        from dashboard_service import codex_quota
+        class RPC:
+            def __init__(self,*args):pass
+            def handshake(self):pass
+            def send(self,*args):pass
+            def close(self):pass
+            def call(self,i,method,params):
+                if method=='initialize':return {}
+                return {'accountId':'account','rateLimits':{'primary':{'windowDurationMins':10080,'usedPercent':81,'resetsAt':2000}}}
+        with patch('dashboard_service.StdioReadOnly',RPC),patch('dashboard_service.D.identity',return_value=('identity','account','user')):
+            key,q=codex_quota(Path('/missing'),1000)
+        self.assertEqual(key,'identity');self.assertEqual(q['remaining_pct'],19)

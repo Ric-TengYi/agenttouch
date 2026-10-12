@@ -97,6 +97,34 @@ class DashboardTests(unittest.TestCase):
             f.write(json.dumps({"type": "response_item", "payload": {"type": "custom_tool_call_output", "output": "x" * 300000}}) + "\n")
         self.assertEqual(D.rollout_status(path, 1000), "running")
 
+    def test_child_completion_cannot_end_parent_turn(self):
+        path=self.home / 'a.jsonl'
+        events=[('task_started', 'main', 'main', None),
+                ('task_started', 'child', 'main', 'main'),
+                ('task_complete', 'child', 'main', None)]
+        path.write_text(''.join(json.dumps({'type':'event_msg','payload':dict(
+            type=kind,turn_id=turn,root_turn_id=root,
+            turn_attribution={'parent_turn_id':parent})})+'\n' for kind,turn,root,parent in events))
+        self.assertEqual(D.rollout_status(path,1000),'running')
+        with path.open('a') as f:
+            f.write(json.dumps({'type':'event_msg','payload':{'type':'task_complete','turn_id':'old','root_turn_id':'old'}})+'\n')
+        self.assertEqual(D.rollout_status(path,1000),'running')
+        with path.open('a') as f:
+            f.write(json.dumps({'type':'event_msg','payload':{'type':'task_complete','turn_id':'main','root_turn_id':'main'}})+'\n')
+        self.assertEqual(D.rollout_status(path,1000),'idle')
+
+    def test_native_root_status_survives_missing_start_in_tail(self):
+        db=sqlite3.connect(self.home/'thread_history_1.sqlite')
+        db.execute('CREATE TABLE thread_turns(thread_id,turn_id,root_turn_id,status,rollout_ordinal)')
+        db.executemany('INSERT INTO thread_turns VALUES(?,?,?,?,?)',[
+            ('a','main','main','inProgress',1),('a','child','main','completed',2),
+            ('b','main','main','completed',1)])
+        db.commit();db.close()
+        (self.home/'a.jsonl').write_text('{}\n')
+        snap=D.read_codex(self.home,1000)
+        self.assertEqual(snap['running']['value'],1)
+        self.assertEqual(next(r for r in snap['tasks'] if r['thread_id']=='a')['state'],'running')
+
     def test_expired_credentials_never_show_old_account_data(self):
         self.assertIsNotNone(D)
         self.assertEqual(D.read_codex(self.home, 3000)["tasks"], [])

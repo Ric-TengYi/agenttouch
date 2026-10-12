@@ -1,0 +1,9 @@
+{
+  "audio_sent": false,
+  "sent_to_conversation": false,
+  "transport": "dictation_stream",
+  "connected": false,
+  "http_status": 403,
+  "content_type": "text/html; charset=UTF-8",
+  "challenge": true
+}

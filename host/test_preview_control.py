@@ -72,6 +72,69 @@ class PreviewTests(unittest.TestCase):
         self.key.assert_any_call(False);self.end.assert_called_once()
         self.assertFalse(self.voice.send('token'))
 
+class NativeCancelTests(unittest.TestCase):
+    setUp = PreviewTests.setUp
+    def test_cancel_after_release_aborts_pending_native_transcription(self):
+        abort=Mock();self.voice.cancel_key=abort
+        self.voice.start('token',True);self.voice.stop('token');self.voice.cancel()
+        abort.assert_called_once();self.assertFalse(self.voice.ready)
+        self.sender.assert_not_called()
+
+    def test_failed_native_cancel_releases_route_and_preserves_destination(self):
+        abort=Mock(side_effect=RuntimeError('failed'));self.voice.cancel_key=abort
+        self.voice.start('token',True)
+        closed=self.preview.close.call_count
+        with self.assertRaises(RuntimeError):self.voice.cancel()
+        self.end.assert_called_once();self.assertFalse(self.voice.down)
+        self.assertTrue(self.voice.native_pending);self.assertFalse(self.voice.ready)
+        self.assertEqual(self.preview.close.call_count,closed)
+
+    def test_stop_failure_cleans_audio_and_never_enables_send(self):
+        abort=Mock();self.voice.cancel_key=abort
+        self.voice.start('token',True)
+        self.key.side_effect=RuntimeError('cannot release')
+        self.assertFalse(self.voice.stop('token'))
+        abort.assert_called_once();self.end.assert_called_once()
+        self.assertFalse(self.voice.down);self.assertFalse(self.voice.ready)
+        self.assertFalse(self.voice.send('token'));self.sender.assert_not_called()
+
+    def test_invalidated_stop_still_cancels_pending_transcription(self):
+        abort=Mock();self.voice.cancel_key=abort
+        self.voice.start('token',True)
+        self.control.target.return_value=None
+        self.assertFalse(self.voice.stop('token'))
+        self.assertTrue(self.voice.native_pending)
+        self.voice.cancel();abort.assert_called_once()
+        self.assertFalse(self.voice.native_pending)
+
+    def test_native_send_requires_own_editor_foreground(self):
+        abort=Mock();self.voice.cancel_key=abort
+        self.voice.start('token',True);self.voice.stop('token')
+        self.preview.call.return_value=dict(active=False,text='指令')
+        self.assertFalse(self.voice.send('token'));self.sender.assert_not_called()
+        abort.assert_not_called()
+
+    def test_native_send_cancels_pending_paste_before_ipc(self):
+        events=[];self.voice.cancel_key=lambda:events.append('cancel')
+        self.sender.side_effect=lambda *args,**kwargs:events.append('send') or True
+        self.voice.start('token',True);self.voice.stop('token')
+        self.assertTrue(self.voice.send('token'))
+        self.assertEqual(events,['cancel','send'])
+
+    def test_route_teardown_failure_still_aborts_native_session(self):
+        abort=Mock();self.voice.cancel_key=abort
+        self.voice.start('token',True);self.end.side_effect=RuntimeError('route failed')
+        self.assertFalse(self.voice.stop('token'));abort.assert_called_once()
+        self.assertFalse(self.voice.native_pending);self.assertFalse(self.voice.ready)
+
+    def test_failed_abort_keeps_preview_alive_for_late_text(self):
+        self.voice.cancel_key=Mock(side_effect=RuntimeError('cancel failed'))
+        self.voice.start('token',True);closed=self.preview.close.call_count
+        self.key.side_effect=RuntimeError('release failed')
+        self.assertFalse(self.voice.stop('token'))
+        self.assertTrue(self.voice.native_pending);self.assertFalse(self.voice.ready)
+        self.assertEqual(self.preview.close.call_count,closed)
+
 class DeliveryTests(unittest.TestCase):
     def client(self):
         c=Mock()

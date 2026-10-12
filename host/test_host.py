@@ -358,6 +358,11 @@ class CodexNotifyTests(unittest.TestCase):
         self.assertIn("side thread", why)
         self.assertIn("task title", why)
 
+    def test_subagent_rollout_does_not_mark_main_done(self):
+        path=next(H.CODEX_SESSIONS.rglob('*'+self.MAIN+'.jsonl'))
+        path.write_text(json.dumps({'type':'session_meta','payload':{'source':{'subagent':{'parent_thread_id':'parent'}}}})+'\n')
+        self.assertFalse(H.codex_turn_is_main({'thread-id':self.MAIN})[0])
+
     def test_legacy_payload_without_thread_id_still_counts(self):
         ok, _ = H.codex_turn_is_main({"type": "agent-turn-complete"})
         self.assertTrue(ok)
@@ -813,11 +818,14 @@ class VoiceToFrontTests(unittest.TestCase):
         self._saved = {k: getattr(H, k) for k in
                        ("inject", "raise_agent_app", "voice_key", "_frontmost_app",
                         "mic_sink_begin", "mic_sink_open_gate", "log", "post_key",
-                        "VOICE_SOURCE", "active_agent", "_voice_to_front")}
+                        "VOICE_SOURCE", "active_agent", "_voice_to_front", "_voice_native", "_voice_board",
+                        "codex_native_key", "codex_native_begin")}
         self.raised, self.keys, self.lines, self.posted = [], [], [], []
         H.inject = lambda fn: fn()          # the worker, run inline
         H.raise_agent_app = self.raised.append
         H.voice_key = self.keys.append
+        H.codex_native_key = self.keys.append
+        H.codex_native_begin = lambda: True
         H.post_key = self.posted.append
         H._frontmost_app = lambda: "Notes|Notes"
         H.mic_sink_begin = lambda: True
@@ -825,6 +833,8 @@ class VoiceToFrontTests(unittest.TestCase):
         H.log = lambda *a: self.lines.append(" ".join(str(x) for x in a))
         H.active_agent = "claude"
         H._voice_to_front = False
+        H._voice_native = False
+        H._voice_board = False
 
     def tearDown(self):
         for k, v in self._saved.items():

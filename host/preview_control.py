@@ -55,10 +55,12 @@ class PreviewWindow:
 
 
 class PreviewVoice:
-    def __init__(self, control, preview, validate, begin, key, end, send):
+    def __init__(self, control, preview, validate, begin, key, end, send, cancel_key=None):
         self.control, self.preview, self.validate = control, preview, validate
         self.begin, self.key, self.end, self.sender = begin, key, end, send
+        self.cancel_key = cancel_key
         self.token, self.down, self.ready = '', False, False
+        self.native_pending = False
         self.error = ''
 
     def current(self, token):
@@ -66,11 +68,27 @@ class PreviewVoice:
         return row if row and row['agent'] == 'codex' and self.validate(row) else None
 
     def cancel(self):
-        if self.down:
-            self.key(False)
-            self.end()
-        self.token, self.down, self.ready = '', False, False
-        self.preview.close()
+        cancelled = not self.native_pending
+        try:
+            if self.cancel_key and self.native_pending:
+                self.cancel_key()
+                cancelled = True
+            elif self.down:
+                self.key(False)
+                cancelled = True
+        finally:
+            try:
+                if self.down:
+                    self.end()
+            finally:
+                self.down, self.ready = False, False
+                if cancelled:
+                    self.token, self.native_pending = '', False
+                    self.preview.close()
+                else:
+                    # Keep the destination alive if native cancellation failed;
+                    # late text must not fall into a different application.
+                    self.error = 'preview_unavailable'
 
     def start(self, token, board_mic):
         self.cancel()
@@ -97,6 +115,7 @@ class PreviewVoice:
                     return False
                 self.key(True)
                 self.token, self.down = token, True
+                self.native_pending = self.cancel_key is not None
             self.error = ''
             return True
         except Exception:
@@ -110,9 +129,31 @@ class PreviewVoice:
     def stop(self, token):
         if token != self.token or not self.down:
             return False
-        self.key(False)
-        self.end()
-        self.down, self.ready = False, bool(self.current(token))
+        stopped = False
+        try:
+            self.key(False)
+            stopped = True
+        except Exception:
+            pass
+        finally:
+            try:
+                self.end()
+            except Exception:
+                stopped = False
+            self.down = False
+        if not stopped:
+            if self.native_pending and self.cancel_key:
+                try:
+                    self.cancel_key()
+                    self.native_pending = False
+                except Exception:
+                    pass
+            self.ready = False
+            self.error = 'preview_unavailable'
+            if not self.native_pending:
+                self.preview.close()
+            return False
+        self.ready = bool(self.current(token))
         self.error = '' if self.ready else 'task_changed'
         return self.ready
 
@@ -123,7 +164,12 @@ class PreviewVoice:
         self.error = 'delivery_unconfirmed'
         try:
             row = self.current(token)
-            text = self.preview.call('read')['text'].strip()
+            result = self.preview.call('read')
+            text = result['text'].strip()
+            if self.native_pending and not result.get('active'):
+                self.error = 'preview_unavailable'
+                self.ready = True
+                return False
             if not row or not self.current(token):
                 self.error = 'task_changed'
                 return False
@@ -131,6 +177,9 @@ class PreviewVoice:
                 self.error = 'preview_empty'
                 self.ready = True  # no mutation attempted; allow editing
                 return False
+            if self.native_pending:
+                self.cancel_key()
+                self.native_pending = False
             def dispatch(emit):
                 with self.control.lock:
                     if not self.current(token):

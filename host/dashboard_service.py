@@ -4,12 +4,12 @@ from pathlib import Path
 import threading
 import time
 import dashboard as D
-from codex_rpc import DaemonWebsocket
+from codex_stdio import StdioReadOnly
 
 
 def codex_quota(home, now):
     key, account, _ = D.identity(home, now)
-    rpc = DaemonWebsocket(home / 'app-server-control/app-server-control.sock')
+    rpc = StdioReadOnly()
     try:
         rpc.handshake()
         rpc.call(1, 'initialize', {'clientInfo': {'name': 'agenttouch_dashboard', 'version': '1'},
@@ -45,7 +45,7 @@ class DashboardService:
         if snap['identity'] != self.quota_key:
             self.quota_key, self.quota = snap['identity'], None
             self.last_quota_try = 0
-        if snap['identity'] and now - self.last_quota_try >= 300:
+        if snap['identity'] and now - self.last_quota_try >= (300 if self.quota else 15):
             self.last_quota_try = now
             try:
                 key, quota = codex_quota(self.home, now)

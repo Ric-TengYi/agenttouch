@@ -37,7 +37,7 @@ PIP_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
 # clang refuses to build (second Mac, 2026-09-26). 11.1 has 3.9 wheels for
 # arm64 and x86_64; host tests pass on it. --only-binary keeps pip from ever
 # compiling: a missing wheel fails fast instead of 16 errors deep.
-PIP_PKGS="bleak==1.1.1 pyobjc-core==11.1 pyobjc-framework-Quartz==11.1 pyobjc-framework-Cocoa==11.1 pyobjc-framework-CoreBluetooth==11.1 pyobjc-framework-libdispatch==11.1 edge-tts==7.2.8"
+PIP_PKGS="bleak==1.1.1 pyobjc-core==11.1 pyobjc-framework-Quartz==11.1 pyobjc-framework-Cocoa==11.1 pyobjc-framework-CoreBluetooth==11.1 pyobjc-framework-libdispatch==11.1 edge-tts==7.2.8 psutil==7.2.2"
 
 CHECK=0; IMPORT=""; REBUILD=0; PILLOW=0
 while [ $# -gt 0 ]; do
@@ -79,12 +79,12 @@ step "2. Python 依赖（装在 $PY 的 --user 里）"
 missing=$("$PY" - <<'EOF'
 import importlib.util as u
 need = {"bleak": "bleak", "Quartz": "pyobjc-framework-Quartz", "AppKit": "pyobjc-framework-Cocoa",
-        "edge_tts": "edge-tts"}
+        "edge_tts": "edge-tts", "psutil": "psutil"}
 print(" ".join(p for m, p in need.items() if u.find_spec(m) is None))
 EOF
 )
 if [ -z "$missing" ]; then
-  ok "bleak / pyobjc / edge-tts 都在"
+  ok "bleak / pyobjc / edge-tts / psutil 都在"
 else
   warn "缺：$missing"
   if doit "pip install --user $PIP_PKGS"; then
@@ -119,7 +119,7 @@ fi
 # ---------------------------------------------------------------------------
 step "3. host 文件 → $DEPLOY"
 [ $CHECK = 1 ] || mkdir -p "$DEPLOY"
-for f in voice_preview.py preview_control.py codex_delivery.py task_control.py task_focus.py dashboard.py dashboard_service.py codex_rpc.py claude_statusline.py agentpet_host.py almanac_bank.json agent_setup.md gen_almanac_font.py pet codex_notify.sh codex_permission_hook.sh; do
+for f in voice_preview.py preview_control.py codex_delivery.py task_control.py task_focus.py dashboard.py dashboard_service.py codex_rpc.py codex_stdio.py mac_performance.py composer_control.py draft_preview.py native_dictation.py conversation_detail.py claude_statusline.py agentpet_host.py almanac_bank.json agent_setup.md gen_almanac_font.py pet codex_notify.sh codex_permission_hook.sh; do
   if cmp -s "$SRC/$f" "$DEPLOY/$f"; then ok "$f 一致"
   elif doit "拷 $f"; then
     cp "$SRC/$f" "$DEPLOY/$f.tmp" && mv -f "$DEPLOY/$f.tmp" "$DEPLOY/$f" && did "$f"

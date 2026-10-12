@@ -51,6 +51,8 @@ def rollout_status(path, now):
         lines = data.splitlines()[1:] if start else data.splitlines()
         state = "unknown"
         pending = set()
+        active_turn = None
+        child_turns = set()
         for line in lines:
             if not any(tag in line for tag in (b'"task_started"', b'"task_complete"', b'"turn_aborted"', b'"request_user_input"', b'"request_permissions"', b'"function_call_output"')):
                 continue
@@ -61,11 +63,21 @@ def rollout_status(path, now):
             p = msg.get("payload") or {}
             typ = p.get("type")
             if msg.get("type") == "event_msg":
+                attribution = p.get("turn_attribution") or {}
+                turn, root = p.get("turn_id"), p.get("root_turn_id")
+                if attribution.get("parent_turn_id") or (turn and root and turn != root):
+                    if typ == "task_started": child_turns.add(turn)
+                    elif typ in ("task_complete", "turn_aborted"): child_turns.discard(turn)
+                    continue
                 if typ == "task_started":
+                    active_turn = turn
                     state, pending = "running", set()
                 elif typ in ("task_complete", "turn_aborted"):
+                    if active_turn and turn != active_turn:
+                        continue
                     state, pending = "idle", set()
             elif msg.get("type") == "response_item":
+                if child_turns: continue
                 if typ == "function_call" and p.get("name") in ("request_user_input", "request_permissions"):
                     pending.add(p.get("call_id"))
                 elif typ == "function_call_output":
@@ -78,6 +90,19 @@ def rollout_status(path, now):
     except (OSError, ValueError, AttributeError, TypeError):
         return "unknown"
 
+
+def native_root_states(home):
+    """Codex's persisted main-turn projection; independent of rollout tail size."""
+    try:
+        db=sqlite3.connect('file:'+str(Path(home)/'thread_history_1.sqlite')+'?mode=ro',uri=True,timeout=1)
+        try:
+            rows=db.execute('SELECT thread_id,status,rollout_ordinal FROM thread_turns '
+                'WHERE turn_id=root_turn_id OR root_turn_id IS NULL ORDER BY rollout_ordinal DESC').fetchall()
+        finally:db.close()
+        states={}
+        for tid,status,_ in rows:states.setdefault(tid,status)
+        return states
+    except (OSError,sqlite3.Error):return {}
 
 def read_codex(home, now):
     home = Path(home)
@@ -107,6 +132,7 @@ def read_codex(home, now):
                               "FROM threads WHERE archived=0").fetchall()
         finally:
             db.close()
+        root_states = native_root_states(home)
         for tid, title, path, source, owner_account, owner_user, updated_at in rows:
             if tid not in visible or "subagent" in str(source):
                 continue
@@ -115,10 +141,15 @@ def read_codex(home, now):
             if not path or not Path(path).resolve().is_relative_to(home.resolve()):
                 status = "unknown"
             else:
-                status = rollout_status(path, now)
+                projected=root_states.get(tid)
+                if projected == "inProgress":
+                    status="waiting" if rollout_status(path,now)=="waiting" else "running"
+                elif projected in ("completed","failed","interrupted"):
+                    status="idle"
+                else:status = rollout_status(path, now)
             snap["tasks"].append({"title": visible.get(tid) or title or "Untitled", "thread_id": tid,
                 "host": "local", "host_label": "Mac", "state": status,
-                "unread": tid in unread if unread_ok else None, "updated_at": updated_at or 0})
+                "unread": tid in unread if unread_ok else None, "updated_at": updated_at or 0, "rollout_path": str(path)})
         snap["unread"] = metric(sum(t["unread"] is True for t in snap["tasks"]), "partial") if unread_ok else metric()
         known = [t for t in snap["tasks"] if t["state"] != "unknown"]
         snap["running"] = metric(sum(t["state"] == "running" for t in known), "partial") if known else metric()
@@ -158,7 +189,7 @@ def read_claude(sessions, quota, now):
             continue
         status = {"working": "running", "needs_you": "waiting", "idle": "idle", "done": "idle"}.get(row.get("state"), "unknown")
         snap["tasks"].append({"title": row.get("title") or row.get("cwd") or "Claude session",
-            "thread_id": sid, "host": "local", "host_label": "Mac", "state": status, "unread": None, "updated_at": row.get("ts", 0)})
+            "thread_id": sid, "host": "local", "host_label": "Mac", "state": status, "unread": None, "updated_at": row.get("ts", 0), "rollout_path": row.get("transcript", "")})
     snap["running"] = metric(sum(t["state"] == "running" for t in snap["tasks"]), "ok")
     snap["waiting"] = metric(sum(t["state"] == "waiting" for t in snap["tasks"]), "ok")
     snap["coverage"] = {"quality": "ok", "reason": "claude_local_sessions"}
@@ -190,6 +221,8 @@ class DashboardStore:
             new["observed_at"] = now
             for index, row in enumerate(new["tasks"]):
                 row["handle"] = "%s:%s" % (new["generation"], index)
+                row["stable_handle"] = "thread:" + hashlib.sha256(
+                    json.dumps([agent,new['identity'],row['host'],row['thread_id']],separators=(',',':')).encode()).hexdigest()[:32]
             self.snapshots[agent] = new
 
     def get(self, agent, now):
@@ -278,7 +311,7 @@ class DashboardStore:
         result.update(total=len(tasks), has_more_read=len(recent) > limit,
                       complete=snap["coverage"]["quality"] == "ok")
         for row in tasks[offset:offset + 4]:
-            item = {key: row[key] for key in ("handle", "host_label", "state", "unread", "kind")}
+            item = {key: row[key] for key in ("handle", "stable_handle", "host_label", "state", "unread", "kind")}
             item["title"] = row["title"][:180]
             result["list"].append(item)
         if offset + len(result["list"]) < len(tasks):
