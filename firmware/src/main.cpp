@@ -24,6 +24,7 @@
 #include "dashboard_gesture.h"
 #include "battery_badge.h"
 #include "clock_cards.h"
+#include "agent_cards.h"
 #include "mac_performance.h"
 #include "pages.h"
 #include "audio.h"
@@ -103,6 +104,8 @@ static bool pmuOk = false, imuOk = false, tpOk = false;
 // ---------- app state ----------
 static uint8_t  agentStates[N_AGENTS] = {ST_OFF};   // ST_OFF == 0: the rest zero-init
 static int      selected  = 0;
+static bool performanceSelected=false, performanceShown=false;
+static const uint8_t PERF_DEBUG_SUB=255;
 static bool     hostUp    = false;
 static bool     listening = false;
 static uint32_t nudgeUntil = 0;   // pin the status toast until this millis()
@@ -342,22 +345,6 @@ static bool anySeatOn() {
     if (agentStates[i] != ST_OFF) return true;
   return false;
 }
-// step +1 = next index, -1 = previous. With every seat off nothing is
-// skipped: all five stay reachable and the picture does not collapse (the
-// host being down puts us here too). With exactly one seat on it returns
-// that seat — including when it IS the current one, so a swipe becomes a
-// no-op instead of landing on a dead app.
-static int nextSeat(int from, int step) {
-  int adv = step > 0 ? 1 : N_AGENTS - 1;
-  int n = (from + adv) % N_AGENTS;
-  if (showOffSeats || !anySeatOn()) return n;
-  for (int k = 0; k < N_AGENTS; k++) {
-    if (agentStates[n] != ST_OFF) return n;
-    n = (n + adv) % N_AGENTS;
-  }
-  return n;                                    // unreachable: anySeatOn() held
-}
-
 // ---- the one door to the TCP socket ---------------------------------------
 // Newline-delimited JSON on one byte stream has a single framing rule: every
 // write ends in '\n' and a started line is always finished. Three writers
@@ -641,7 +628,7 @@ static void sessStep(int dir) {
 // state message and from the cfg that turns 「显示离线席位」 back off (the
 // selected seat may have gone off while the setting was hiding this rule).
 static void autoReselectIfOff() {
-  if (showOffSeats) return;
+  if (showOffSeats || performanceSelected) return;
   if (agentStates[selected] != ST_OFF || !anySeatOn()) return;
   for (int i = 0; i < N_AGENTS; i++) {
     if (agentStates[i] == ST_OFF) continue;
@@ -1644,12 +1631,12 @@ static void handleLine(const String& line) {
     // hand while the first card was up and never got its own edge. A seat
     // the user deliberately swiped away from stays ignored (no edge here).
     // Asleep (face-down) the pet neither switches nor raises Mac windows.
-    if (!listening && !flipped && agentStates[selected] != ST_NEEDS_YOU) {
-      bool relay = prev[selected] == ST_NEEDS_YOU;
+    if (!listening && !flipped && (performanceSelected || agentStates[selected] != ST_NEEDS_YOU)) {
+      bool relay = !performanceSelected && prev[selected] == ST_NEEDS_YOU;
       for (int i = 0; i < N_AGENTS; i++) {
-        if (i != selected && agentStates[i] == ST_NEEDS_YOU &&
+        if ((i != selected || performanceSelected) && agentStates[i] == ST_NEEDS_YOU &&
             (relay || prev[i] != ST_NEEDS_YOU)) {
-          selected = i;
+          selected = i; performanceSelected=false;
           sendEvent("select", "agent", AGENTS[i].id);
           if (relay && !ttsWill) audioPlay(SND_NEEDS);   // "next one's up"
           break;
@@ -1687,8 +1674,8 @@ static void handleLine(const String& line) {
     noteActivity();
   } else if (strcmp(t, "select") == 0) {    // host: Mac front app changed -> follow it (doc/06 最后意图获胜)
     int i = agentIdxById(d["agent"] | "");
-    if (i >= 0 && i != selected) {
-      selected = i;                          // silent: the user is at the Mac, not looking for a chirp
+    if (i >= 0 && (i != selected || performanceSelected)) {
+      selected = i; performanceSelected=false; // silent: the user is at the Mac, not looking for a chirp
       noteActivity();
     }
     JsonDocument r;                          // echo so the host can confirm; src tells it not to re-follow
@@ -1726,14 +1713,14 @@ static void handleLine(const String& line) {
     r["pos"] = pos; r["dur"] = dur; r["play"] = playing ? 1 : 0;
     r["n"] = playerCount(); r["i"] = playerInfo().index;
     r["src"] = src == PSRC_MAC ? "mac" : "sd";
-    r["page"] = clockView == CV_PERF ? "perf" : clockView == CV_NP ? "np" : clockView == CV_POD ? "pod" : "clock";
+    r["page"] = performanceShown ? "perf" : clockView == CV_NP ? "np" : clockView == CV_POD ? "pod" : "clock";
     sendJson(r);
   } else if (strcmp(t, "view") == 0) {      // host debug (/test/view/<p>): force a page for s seconds
     const char* pv = d["p"] | "";
     int sec = d["s"] | 20;
     uint8_t pg = 255, sub = 0;
     if      (!strcmp(pv, "face"))     { pg = PAGE_FACE; }
-    else if (!strcmp(pv, "perf")) { pg = PAGE_CLOCK; sub = CV_PERF; }
+    else if (!strcmp(pv, "perf")) { pg = PAGE_FACE; sub = PERF_DEBUG_SUB; }
     else if (!strcmp(pv, "clock"))    { pg = PAGE_CLOCK;    sub = CV_CLOCK; }
     else if (!strcmp(pv, "np") || !strcmp(pv, "play")) { pg = PAGE_CLOCK; sub = CV_NP; }
     else if (!strcmp(pv, "pod"))      { pg = PAGE_CLOCK;    sub = CV_POD; }
@@ -2656,8 +2643,15 @@ static uint32_t pendAt = 0;
 
 static void execPendingSwipe() {
   if (pendH) {
-    selected = nextSeat(selected, pendH < 0 ? +1 : -1);   // off seats skipped
-    sendEvent("select", "agent", AGENTS[selected].id);
+    bool enabled[N_AGENTS];
+    for(int i=0;i<N_AGENTS;++i)enabled[i]=agentStates[i]!=ST_OFF;
+    int card=agentCardStep(performanceSelected?N_AGENTS:selected,pendH<0?1:-1,enabled,N_AGENTS,showOffSeats);
+    performanceSelected=card==N_AGENTS;
+    profUntil=setCardUntil=sendUntil=0;
+    if(!performanceSelected) {
+      selected=card;
+      sendEvent("select", "agent", AGENTS[selected].id);
+    }
     audioPlay(SND_SELECT);
   } else if (pendV) {
     audioSetVolume(audioVolume() + (pendV > 0 ? 10 : -10));
@@ -2743,7 +2737,7 @@ static void touchPoll() {
     }
     // petting = back-and-forth rubbing, either axis, lifts allowed: the
     // finger reversing direction is what a deliberate swipe never does
-    if (tpWasDown && shownPage == PAGE_FACE && !pickedUp && !dashboardOpen()) {
+    if (tpWasDown && shownPage == PAGE_FACE && !performanceShown && !pickedUp && !dashboardOpen()) {
       int sx = x - tpLastX, sy = y - tpLastY;
       int8_t dir = 0;
       if      (abs(sx) > 5 && abs(sx) >= abs(sy)) dir = sx > 0 ? 1 : -1;
@@ -2782,7 +2776,7 @@ static void touchPoll() {
     // own long-press (reject), so the hold is inert while needs_you is up
     // (the bubble's own rule: the current session's state).
     if (tpWasDown && !tpConsumed && !pendH && !pendV && !demoStart &&
-        shownPage == PAGE_FACE && !listening && !dashboardOpen() &&
+        shownPage == PAGE_FACE && !performanceShown && !listening && !dashboardOpen() &&
         sessEffState() != ST_NEEDS_YOU &&
         (int32_t)(petUntil - millis()) <= 0 &&
         (int32_t)(setCardUntil - millis()) <= 0 && !claimShowing() &&
@@ -2852,6 +2846,10 @@ static void touchPoll() {
         if (hold || hit < 0) claimResolve(false, "declined");
         else if (hit == 1)   claimResolve(true, "tap");
       }
+    } else if (performanceShown) {
+      // This card owns only horizontal navigation, never task/media/approve taps.
+      if(vh) { pendH=vdx<0?-1:1; pendV=0; pendAt=millis(); }
+      tpConsumed=false;
     } else if (dashboardGestureActive && dashboardOpen() && shownPage==PAGE_FACE &&
                !listening && sessEffState()!=ST_NEEDS_YOU && [&]() {
                  int gx,gy; dashboardXY(tpLastX,tpLastY,gx,gy); return dashboardGesture.back(gx,gy);
@@ -3282,7 +3280,7 @@ void loop() {
   // (10 s at most) hard-cuts the rail no matter what REG 22H[1] says — it is
   // EFUSE-locked on this part (measured: rst=poweron at ~10 s with the bit
   // cleared). A dictation key that kills the board mid-sentence is no key.
-  if (bIo18.pressed && (!dashboardOpen() || dashboardVoiceToken().length())) {
+  if (bIo18.pressed && !performanceShown && (!dashboardOpen() || dashboardVoiceToken().length())) {
     listening = true;
     dashboardVoiceBegin();
     sendUntil = 0;                     // new dictation: retire the old bubble
@@ -3657,7 +3655,7 @@ void loop() {
     {
       static uint32_t needsShowUntil = 0;
       if (agentStates[selected] == ST_NEEDS_YOU) needsShowUntil = now + 2000;
-      if (!demoStart && (int32_t)(needsShowUntil - now) > 0) {
+      if (!demoStart && !performanceSelected && (int32_t)(needsShowUntil - now) > 0) {
         pg = PAGE_FACE;
         rotSec = held ? gravSector : orient;
       }
@@ -3690,18 +3688,20 @@ void loop() {
     int32_t pleft = (int32_t)(toastUntil - now);
     float pinK = pleft <= 0 ? 0.0f : (pleft < 400 ? pleft / 400.0f : 1.0f);
     const char* pinLabel = toastText;
-    bool perfShown=pg==PAGE_CLOCK && (viewLock?viewSub:bound?CV_CLOCK:clockView)==CV_PERF;
-    if(!perfShown)macPerformanceInvalidate();
+    performanceShown=pg==PAGE_FACE && !claimShowing() && !demoStart &&
+      (viewLock?viewSub==PERF_DEBUG_SUB:performanceSelected);
+    if(!performanceShown)macPerformanceInvalidate();
+    if(performanceShown) {
+      dashboardInvalidateFrame();
+      macPerformanceRender(canvas,gfx,now,(4-rotSec)&3,battFakeOn()?battFakePct:liveBatteryPct,
+        powState==1,pinned,(int32_t)(pinLitUntil-now)>0,0x4dff,pinLabel,pinK);
+      delay(2);return;
+    }
     if (pg != PAGE_FACE) {
       dashboardInvalidateFrame();
       canvas->setRotation((4 - rotSec) & 3);
       uint8_t cv = viewLock ? viewSub : bound ? CV_CLOCK : clockView;
       bool wantAlm = viewLock ? viewSub != 0 : (bound ? true : almanacView);
-      if (pg == PAGE_CLOCK && cv==CV_PERF) {
-        macPerformanceRender(canvas,gfx,now,(4-rotSec)&3,battFakeOn()?battFakePct:liveBatteryPct,
-          powState==1,pinned,(int32_t)(pinLitUntil-now)>0,AGENTS[selected].color,pinLabel,pinK);
-        delay(2);return;
-      }
       if (pg == PAGE_CLOCK) {
         // clock is home for this orientation; 播客 (right) and 当前播放 (left)
         // are its two flip sides, one renderer with the page's own source

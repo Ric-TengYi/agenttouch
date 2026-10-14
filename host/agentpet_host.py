@@ -7302,7 +7302,7 @@ footer .sp{flex:1}
 
  <div class="page" data-page="host">
   <section><div class="grp">
-   <div class="row"><div class="lab"><span>Mac 性能监控</span><small>时钟页左右滑动可切换；网络统计 Wi-Fi / 有线接口</small></div><span class="val" id="perf_summary">等待数据</span></div>
+   <div class="row"><div class="lab"><span>Mac 性能监控</span><small>Agent 页面左右滑动可切换；网络统计 Wi-Fi / 有线接口</small></div><span class="val" id="perf_summary">等待数据</span></div>
   </div></section>
   <section><div class="grp">
    <div class="row"><div class="lab"><span data-t="host_t"></span><small data-th="host_sub"></small></div><button class="danger sm" onclick="restart()" data-t="restart_btn"></button></div>
