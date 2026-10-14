@@ -62,8 +62,8 @@ void macPerformanceRender(Arduino_Canvas* c,Arduino_GFX* output,uint32_t now,int
  centered(c,350,"磁盘 读 "+amount(valid?perf.read:-1,true)+"  写 "+amount(valid?perf.write:-1,true));
  String status=!perf.at?"等待 Mac 数据":stale?"数据已过期":perf.status=="ok"?"实时 · 每2秒更新":perf.status=="warming"?"首次采样中...":perf.status=="partial"?"部分数据暂不可用":"数据暂不可用";
  centered(c,393,status,false,stale?0xfd20:0x8410);
- centered(c,421,"左右滑动切换卡片",false,0x8410);
- for(int i=0;i<4;++i)c->fillCircle(213+i*18,443,3,i==2?accent:0x4208);
+ centered(c,421,"左右滑动切换 Agent",false,0x8410);
+
  if(pinned)drawPagePin(c,bright,accent);
  drawPillToast(c,toast,toastK,368);
  drawBatteryBadge(c,battery,charging);
